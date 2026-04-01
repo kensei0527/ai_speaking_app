@@ -35,11 +35,32 @@ app.add_middleware(
 )
 
 
-# ─── Startup: Seed chapters if empty ────────────────────────────────────────
+from sqlalchemy import text
+
+# ─── Startup: Seed chapters & Run migrations ─────────────────────────────────
 @app.on_event("startup")
 def startup_seed():
     db = database.SessionLocal()
     try:
+        # Run lightweight migrations for existing `attempts` table
+        try:
+            db.execute(text("ALTER TABLE attempts ADD COLUMN lesson_id INTEGER;"))
+            db.commit()
+        except Exception:
+            db.rollback()
+            
+        try:
+            db.execute(text("ALTER TABLE attempts ADD COLUMN alternative_expressions TEXT;"))
+            db.commit()
+        except Exception:
+            db.rollback()
+
+        try:
+            db.execute(text("ALTER TABLE attempts ADD COLUMN naturalness_tips TEXT;"))
+            db.commit()
+        except Exception:
+            db.rollback()
+
         count = db.query(models.Chapter).count()
         if count == 0:
             from seed_chapters import seed
