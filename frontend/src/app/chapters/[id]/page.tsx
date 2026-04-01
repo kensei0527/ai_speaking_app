@@ -72,7 +72,10 @@ export default function ChapterDetailPage() {
       const {
         data: { session },
       } = await supabase.auth.getSession();
-      if (!session) return;
+      if (!session) {
+        window.location.href = "/login";
+        return;
+      }
 
       try {
         const res = await fetch(`${API_URL}/api/chapters/${chapterId}`, {

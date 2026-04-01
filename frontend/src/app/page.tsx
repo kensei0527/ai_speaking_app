@@ -100,7 +100,10 @@ export default function Dashboard() {
       const {
         data: { session },
       } = await supabase.auth.getSession();
-      if (!session) return;
+      if (!session) {
+        window.location.href = "/login";
+        return;
+      }
 
       try {
         const API_URL = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
