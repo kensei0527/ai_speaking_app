@@ -19,6 +19,7 @@ app = FastAPI(title="AI English Composition App", version="3.0.0")
 # Configure CORS for Next.js frontend
 origins = [
     "http://localhost:3000",
+    "http://127.0.0.1:3000",
 ]
 frontend_url = os.getenv("FRONTEND_URL")
 if frontend_url:
@@ -26,7 +27,8 @@ if frontend_url:
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"] if os.getenv("VERCEL") == "1" else origins,
+    allow_origins=origins,
+    allow_origin_regex=r"https://(?:.*\.vercel\.app|.*-furuyakenseis-projects\.vercel\.app)",
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
