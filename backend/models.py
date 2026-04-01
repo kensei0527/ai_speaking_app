@@ -15,6 +15,7 @@ class User(Base):
 
     attempts = relationship("Attempt", back_populates="user")
     chapter_progress = relationship("UserChapterProgress", back_populates="user")
+    lessons = relationship("Lesson", back_populates="user")
 
 
 class Chapter(Base):
@@ -67,13 +68,48 @@ class Attempt(Base):
     id = Column(Integer, primary_key=True, index=True)
     user_id = Column(String, ForeignKey("users.id"))
     question_id = Column(Integer, ForeignKey("questions.id"))
+    lesson_id = Column(Integer, ForeignKey("lessons.id"), nullable=True)  # Which lesson this attempt belongs to
     user_answer = Column(Text)
     is_correct = Column(Boolean, default=False)
     ai_feedback = Column(Text)
+    alternative_expressions = Column(Text, nullable=True)  # JSON array of alternative expressions
+    naturalness_tips = Column(Text, nullable=True)         # JSON array of naturalness tips
     score = Column(Float)           # Score out of 100 on this attempt
     grammar_point = Column(String, nullable=True)  # Denormalized for analytics
     chapter_id = Column(Integer, ForeignKey("chapters.id"), nullable=True)  # Denormalized
     created_at = Column(DateTime, default=datetime.datetime.utcnow)
 
     user = relationship("User", back_populates="attempts")
+    question = relationship("Question")
+    lesson = relationship("Lesson", back_populates="attempts")
+
+
+class Lesson(Base):
+    """A single lesson session containing multiple questions generated at once."""
+    __tablename__ = "lessons"
+
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(String, ForeignKey("users.id"), nullable=False)
+    chapter_id = Column(Integer, ForeignKey("chapters.id"), nullable=False)
+    status = Column(String, default="active")   # active / completed
+    total_questions = Column(Integer, default=0)
+    started_at = Column(DateTime, default=datetime.datetime.utcnow)
+    completed_at = Column(DateTime, nullable=True)
+
+    user = relationship("User", back_populates="lessons")
+    chapter = relationship("Chapter")
+    questions = relationship("LessonQuestion", back_populates="lesson", order_by="LessonQuestion.order_index")
+    attempts = relationship("Attempt", back_populates="lesson")
+
+
+class LessonQuestion(Base):
+    """Junction table linking a Lesson to its ordered Questions."""
+    __tablename__ = "lesson_questions"
+
+    id = Column(Integer, primary_key=True, index=True)
+    lesson_id = Column(Integer, ForeignKey("lessons.id"), nullable=False)
+    question_id = Column(Integer, ForeignKey("questions.id"), nullable=False)
+    order_index = Column(Integer, nullable=False)  # 0-based order within lesson
+
+    lesson = relationship("Lesson", back_populates="questions")
     question = relationship("Question")

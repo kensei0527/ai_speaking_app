@@ -16,6 +16,7 @@ import {
   Target,
   TrendingUp,
   Zap,
+  BarChart2,
 } from "lucide-react";
 import { motion } from "framer-motion";
 import { createClient } from "@/utils/supabase/client";
@@ -169,13 +170,21 @@ export default function Dashboard() {
             </span>
           </h1>
         </div>
-        <button
-          onClick={handleLogout}
-          className="flex items-center gap-2 text-slate-400 hover:text-red-500 transition-colors px-3 py-2 rounded-lg hover:bg-red-50 dark:hover:bg-red-950/30"
-        >
-          <LogOut size={18} />
-          <span className="text-sm font-medium hidden sm:inline">ログアウト</span>
-        </button>
+        <div className="flex items-center gap-2">
+          <Link href="/profile">
+            <button className="flex items-center gap-2 text-slate-400 hover:text-indigo-500 transition-colors px-3 py-2 rounded-lg hover:bg-indigo-50 dark:hover:bg-indigo-950/30">
+              <BarChart2 size={18} />
+              <span className="text-sm font-medium hidden sm:inline">スキルレポート</span>
+            </button>
+          </Link>
+          <button
+            onClick={handleLogout}
+            className="flex items-center gap-2 text-slate-400 hover:text-red-500 transition-colors px-3 py-2 rounded-lg hover:bg-red-50 dark:hover:bg-red-950/30"
+          >
+            <LogOut size={18} />
+            <span className="text-sm font-medium hidden sm:inline">ログアウト</span>
+          </button>
+        </div>
       </motion.div>
 
       <div className="w-full max-w-5xl space-y-8">
@@ -200,6 +209,9 @@ export default function Dashboard() {
                   {level.label}{" "}
                   <span className="text-lg font-medium text-slate-400">({stats.overall_level})</span>
                 </h2>
+                <p className="text-xs text-slate-400 dark:text-slate-500 mt-1">
+                  {stats.chapters_mastered}章マスター・スコア{stats.overall_score.toFixed(0)}に基づく判定
+                </p>
               </div>
             </div>
             <div className="flex gap-4 sm:gap-6 flex-wrap">

@@ -6,6 +6,7 @@ from sqlalchemy import func
 from fastapi.middleware.cors import CORSMiddleware
 from collections import defaultdict
 import datetime
+import json
 import uvicorn
 import os
 
@@ -13,7 +14,7 @@ import models, schemas, database, ai_service, auth
 
 models.Base.metadata.create_all(bind=database.engine)
 
-app = FastAPI(title="AI English Composition App", version="2.0.0")
+app = FastAPI(title="AI English Composition App", version="3.0.0")
 
 # Configure CORS for Next.js frontend
 origins = [
@@ -23,7 +24,6 @@ frontend_url = os.getenv("FRONTEND_URL")
 if frontend_url:
     origins.append(frontend_url)
 
-# Allow all in Vercel preview environments if needed, but safe to default to localhost + specific host
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"] if os.getenv("VERCEL") == "1" else origins,
@@ -106,38 +106,72 @@ def get_weak_points(user_id: str, chapter_id: int, db: Session) -> list[schemas.
 
 
 # ─── Helper: check and unlock next chapter ───────────────────────────────────
-def check_chapter_mastery(user_id: str, chapter_id: int, db: Session):
-    """Check if a chapter should be marked as mastered and unlock next."""
+def check_chapter_mastery(user_id: str, chapter_id: int, db: Session) -> dict:
+    """
+    Check if a chapter should be marked as mastered and unlock next.
+    Mastery conditions (improved):
+    - score >= 80
+    - total_attempts >= 20
+    - Each grammar point attempted at least twice
+    Returns dict with mastered and next_chapter_unlocked flags.
+    """
+    result = {"mastered": False, "next_chapter_unlocked": False}
+
     progress = db.query(models.UserChapterProgress).filter(
         models.UserChapterProgress.user_id == user_id,
         models.UserChapterProgress.chapter_id == chapter_id
     ).first()
 
-    if not progress:
-        return
+    if not progress or progress.status == "mastered":
+        return result
 
-    # Mastery condition: score >= 80 AND at least 10 attempts
-    if progress.proficiency_score >= 80 and progress.total_attempts >= 10:
-        if progress.status != "mastered":
-            progress.status = "mastered"
+    # Get the chapter to know its grammar points
+    chapter = db.query(models.Chapter).filter(models.Chapter.id == chapter_id).first()
+    if not chapter:
+        return result
 
-            # Unlock next chapter
-            current_chapter = db.query(models.Chapter).filter(
-                models.Chapter.id == chapter_id
-            ).first()
-            if current_chapter:
-                next_chapter = db.query(models.Chapter).filter(
-                    models.Chapter.number == current_chapter.number + 1
-                ).first()
-                if next_chapter:
-                    next_progress = db.query(models.UserChapterProgress).filter(
-                        models.UserChapterProgress.user_id == user_id,
-                        models.UserChapterProgress.chapter_id == next_chapter.id
-                    ).first()
-                    if next_progress and next_progress.status == "locked":
-                        next_progress.status = "available"
+    grammar_points = [gp.strip() for gp in chapter.grammar_points.split(",")]
 
-            db.commit()
+    # Check: score >= 80 AND total_attempts >= 20
+    if progress.proficiency_score < 80 or progress.total_attempts < 20:
+        return result
+
+    # Check: each grammar point attempted at least twice
+    attempts = db.query(models.Attempt).filter(
+        models.Attempt.user_id == user_id,
+        models.Attempt.chapter_id == chapter_id,
+        models.Attempt.grammar_point.isnot(None)
+    ).all()
+
+    gp_count = defaultdict(int)
+    for a in attempts:
+        if a.grammar_point:
+            gp_count[a.grammar_point] += 1
+
+    # All grammar points must have been attempted at least twice
+    all_covered = all(gp_count.get(gp, 0) >= 2 for gp in grammar_points)
+    if not all_covered:
+        return result
+
+    # Mark as mastered
+    progress.status = "mastered"
+    result["mastered"] = True
+
+    # Unlock next chapter
+    next_chapter = db.query(models.Chapter).filter(
+        models.Chapter.number == chapter.number + 1
+    ).first()
+    if next_chapter:
+        next_progress = db.query(models.UserChapterProgress).filter(
+            models.UserChapterProgress.user_id == user_id,
+            models.UserChapterProgress.chapter_id == next_chapter.id
+        ).first()
+        if next_progress and next_progress.status == "locked":
+            next_progress.status = "available"
+            result["next_chapter_unlocked"] = True
+
+    db.commit()
+    return result
 
 
 # ─── Helper: update overall proficiency ──────────────────────────────────────
@@ -161,13 +195,24 @@ def update_overall_proficiency(user: models.User, db: Session):
     db.commit()
 
 
+# ─── Helper: determine lesson size based on grammar points ───────────────────
+def calc_lesson_size(grammar_points_str: str) -> int:
+    """
+    Case C: Determine lesson size based on number of grammar points.
+    Each grammar point gets ~2 questions, minimum 4, maximum 10.
+    """
+    grammar_points = [gp.strip() for gp in grammar_points_str.split(",") if gp.strip()]
+    size = len(grammar_points) * 2
+    return max(4, min(size, 10))
+
+
 # ═══════════════════════════════════════════════════════════════════════════════
 # API ENDPOINTS
 # ═══════════════════════════════════════════════════════════════════════════════
 
 @app.get("/")
 def read_root():
-    return {"message": "Welcome to the AI English Composition API v2.0"}
+    return {"message": "Welcome to the AI English Composition API v3.0"}
 
 
 @app.get("/api/users/me", response_model=schemas.UserResponse)
@@ -275,37 +320,43 @@ def get_chapter_detail(
     )
 
 
-# ─── Question Generation ─────────────────────────────────────────────────────
+# ─── Lesson Endpoints ─────────────────────────────────────────────────────────
 
-@app.post("/api/questions/generate", response_model=schemas.QuestionResponse)
-def generate_question(
-    req: schemas.GenerateQuestionRequest,
+@app.post("/api/lessons/start", response_model=schemas.LessonResponse)
+def start_lesson(
+    req: schemas.LessonStartRequest,
     db: Session = Depends(database.get_db),
     user: models.User = Depends(auth.get_current_user)
 ):
-    """Generate a question for a specific chapter, considering user history."""
+    """
+    Start a new lesson for a chapter.
+    Generates all questions at once (batch) and returns them.
+    Lesson size is determined by the number of grammar points in the chapter.
+    """
     ensure_chapter_progress(user, db)
 
-    # Get chapter
     chapter = db.query(models.Chapter).filter(models.Chapter.id == req.chapter_id).first()
     if not chapter:
         raise HTTPException(status_code=404, detail="Chapter not found")
 
-    # Check if chapter is accessible
+    # Check access
     progress = db.query(models.UserChapterProgress).filter(
         models.UserChapterProgress.user_id == user.id,
         models.UserChapterProgress.chapter_id == req.chapter_id
     ).first()
 
     if progress and progress.status == "locked":
-        raise HTTPException(status_code=403, detail="This chapter is still locked. Complete the previous chapter first.")
+        raise HTTPException(status_code=403, detail="This chapter is still locked.")
 
-    # Mark as in_progress if currently available
+    # Mark as in_progress
     if progress and progress.status == "available":
         progress.status = "in_progress"
         db.commit()
 
-    # Get user's recent attempts for this chapter
+    # Calculate lesson size (Case C: based on grammar points)
+    lesson_size = calc_lesson_size(chapter.grammar_points)
+
+    # Get user history for smarter generation
     recent_attempts = db.query(models.Attempt).filter(
         models.Attempt.user_id == user.id,
         models.Attempt.chapter_id == req.chapter_id
@@ -320,12 +371,253 @@ def generate_question(
         for a in recent_attempts
     ]
 
-    # Get weak points
     weak_point_infos = get_weak_points(user.id, req.chapter_id, db)
     weak_point_names = [wp.grammar_point for wp in weak_point_infos]
 
-    # Generate via AI
     chapter_score = progress.proficiency_score if progress else 0.0
+
+    # Generate all questions at once (single AI call)
+    q_data_list = ai_service.generate_questions_batch(
+        chapter_title=chapter.title,
+        chapter_grammar_points=chapter.grammar_points,
+        cefr_level=chapter.cefr_level,
+        proficiency_score=chapter_score,
+        count=lesson_size,
+        user_history=user_history if user_history else None,
+        weak_points=weak_point_names if weak_point_names else None,
+    )
+
+    # Save questions to DB
+    saved_questions = []
+    for q_data in q_data_list:
+        new_q = models.Question(
+            japanese_text=q_data.japanese_text,
+            expected_english_text=q_data.expected_english_text,
+            grammar_point=q_data.grammar_point,
+            difficulty=q_data.difficulty,
+            chapter_id=chapter.id,
+        )
+        db.add(new_q)
+        db.flush()  # Get the ID without committing
+        saved_questions.append(new_q)
+
+    # Create Lesson record
+    lesson = models.Lesson(
+        user_id=user.id,
+        chapter_id=chapter.id,
+        total_questions=len(saved_questions),
+    )
+    db.add(lesson)
+    db.flush()
+
+    # Create LessonQuestion junction records
+    for idx, q in enumerate(saved_questions):
+        lq = models.LessonQuestion(
+            lesson_id=lesson.id,
+            question_id=q.id,
+            order_index=idx,
+        )
+        db.add(lq)
+
+    db.commit()
+    db.refresh(lesson)
+
+    # Build response
+    question_infos = []
+    for lq in lesson.questions:
+        q = db.query(models.Question).filter(models.Question.id == lq.question_id).first()
+        question_infos.append(schemas.LessonQuestionInfo(
+            id=q.id,
+            japanese_text=q.japanese_text,
+            expected_english_text=q.expected_english_text,
+            grammar_point=q.grammar_point,
+            difficulty=q.difficulty,
+            order_index=lq.order_index,
+        ))
+
+    return schemas.LessonResponse(
+        lesson_id=lesson.id,
+        chapter_id=chapter.id,
+        questions=question_infos,
+        total_questions=lesson.total_questions,
+    )
+
+
+@app.post("/api/lessons/{lesson_id}/complete", response_model=schemas.LessonCompleteResponse)
+def complete_lesson(
+    lesson_id: int,
+    req: schemas.LessonCompleteRequest,
+    db: Session = Depends(database.get_db),
+    user: models.User = Depends(auth.get_current_user)
+):
+    """
+    Submit all answers for a lesson at once.
+    Evaluates each answer, updates progress, checks for mastery.
+    """
+    lesson = db.query(models.Lesson).filter(
+        models.Lesson.id == lesson_id,
+        models.Lesson.user_id == user.id,
+    ).first()
+    if not lesson:
+        raise HTTPException(status_code=404, detail="Lesson not found")
+    if lesson.status == "completed":
+        raise HTTPException(status_code=400, detail="Lesson already completed")
+
+    # Build a map of question_id -> LessonQuestion for order_index lookup
+    lq_map = {lq.question_id: lq for lq in lesson.questions}
+
+    results = []
+    correct_count = 0
+    total_score = 0.0
+
+    for answer_item in req.answers:
+        question = db.query(models.Question).filter(
+            models.Question.id == answer_item.question_id
+        ).first()
+        if not question:
+            continue
+
+        lq = lq_map.get(answer_item.question_id)
+        order_index = lq.order_index if lq else 0
+
+        # Evaluate with AI
+        eval_result = ai_service.evaluate_answer(
+            japanese=question.japanese_text,
+            expected_english=question.expected_english_text,
+            user_answer=answer_item.user_answer,
+            grammar_point=question.grammar_point,
+        )
+
+        # Save attempt
+        attempt = models.Attempt(
+            user_id=user.id,
+            question_id=question.id,
+            lesson_id=lesson.id,
+            user_answer=answer_item.user_answer,
+            is_correct=eval_result.is_correct,
+            ai_feedback=eval_result.feedback_text,
+            alternative_expressions=json.dumps(eval_result.alternative_expressions, ensure_ascii=False),
+            naturalness_tips=json.dumps(eval_result.naturalness_tips, ensure_ascii=False),
+            score=eval_result.score,
+            grammar_point=question.grammar_point,
+            chapter_id=question.chapter_id,
+        )
+        db.add(attempt)
+
+        # Update chapter progress
+        if question.chapter_id:
+            progress = db.query(models.UserChapterProgress).filter(
+                models.UserChapterProgress.user_id == user.id,
+                models.UserChapterProgress.chapter_id == question.chapter_id
+            ).first()
+            if progress:
+                progress.total_attempts += 1
+                if eval_result.is_correct:
+                    progress.correct_attempts += 1
+
+                # Exponential moving average for chapter score
+                alpha = 0.3
+                progress.proficiency_score = round(
+                    (1 - alpha) * progress.proficiency_score + alpha * eval_result.score, 1
+                )
+                progress.last_attempted_at = datetime.datetime.utcnow()
+
+        if eval_result.is_correct:
+            correct_count += 1
+        total_score += eval_result.score
+
+        results.append(schemas.LessonAnswerResult(
+            question_id=question.id,
+            order_index=order_index,
+            japanese_text=question.japanese_text,
+            user_answer=answer_item.user_answer,
+            is_correct=eval_result.is_correct,
+            score=eval_result.score,
+            feedback_text=eval_result.feedback_text,
+            expected_english=eval_result.expected_english,
+            grammar_point=eval_result.grammar_point,
+            alternative_expressions=eval_result.alternative_expressions,
+            naturalness_tips=eval_result.naturalness_tips,
+        ))
+
+    db.commit()
+
+    # Check mastery
+    mastery_result = check_chapter_mastery(user.id, lesson.chapter_id, db)
+
+    # Update overall proficiency
+    update_overall_proficiency(user, db)
+
+    # Mark lesson as completed
+    lesson.status = "completed"
+    lesson.completed_at = datetime.datetime.utcnow()
+    db.commit()
+
+    answered_count = len(results)
+    accuracy = round((correct_count / answered_count * 100) if answered_count > 0 else 0, 1)
+    avg_score = round(total_score / answered_count if answered_count > 0 else 0, 1)
+
+    # Sort results by order_index
+    results.sort(key=lambda r: r.order_index)
+
+    return schemas.LessonCompleteResponse(
+        lesson_id=lesson.id,
+        chapter_id=lesson.chapter_id,
+        total_questions=answered_count,
+        correct_count=correct_count,
+        accuracy_rate=accuracy,
+        average_score=avg_score,
+        chapter_mastered=mastery_result["mastered"],
+        next_chapter_unlocked=mastery_result["next_chapter_unlocked"],
+        results=results,
+    )
+
+
+# ─── Legacy: Single Question Generation (kept for backward compat) ────────────
+
+@app.post("/api/questions/generate", response_model=schemas.QuestionResponse)
+def generate_question(
+    req: schemas.GenerateQuestionRequest,
+    db: Session = Depends(database.get_db),
+    user: models.User = Depends(auth.get_current_user)
+):
+    """Generate a single question (legacy endpoint)."""
+    ensure_chapter_progress(user, db)
+
+    chapter = db.query(models.Chapter).filter(models.Chapter.id == req.chapter_id).first()
+    if not chapter:
+        raise HTTPException(status_code=404, detail="Chapter not found")
+
+    progress = db.query(models.UserChapterProgress).filter(
+        models.UserChapterProgress.user_id == user.id,
+        models.UserChapterProgress.chapter_id == req.chapter_id
+    ).first()
+
+    if progress and progress.status == "locked":
+        raise HTTPException(status_code=403, detail="This chapter is still locked.")
+
+    if progress and progress.status == "available":
+        progress.status = "in_progress"
+        db.commit()
+
+    recent_attempts = db.query(models.Attempt).filter(
+        models.Attempt.user_id == user.id,
+        models.Attempt.chapter_id == req.chapter_id
+    ).order_by(models.Attempt.created_at.desc()).limit(10).all()
+
+    user_history = [
+        {
+            "grammar_point": a.grammar_point or "不明",
+            "is_correct": a.is_correct,
+            "user_answer": a.user_answer,
+        }
+        for a in recent_attempts
+    ]
+
+    weak_point_infos = get_weak_points(user.id, req.chapter_id, db)
+    weak_point_names = [wp.grammar_point for wp in weak_point_infos]
+    chapter_score = progress.proficiency_score if progress else 0.0
+
     q_data = ai_service.generate_question(
         chapter_title=chapter.title,
         chapter_grammar_points=chapter.grammar_points,
@@ -336,7 +628,6 @@ def generate_question(
         topic=req.topic,
     )
 
-    # Save the generated question to DB
     new_q = models.Question(
         japanese_text=q_data.japanese_text,
         expected_english_text=q_data.expected_english_text,
@@ -347,11 +638,10 @@ def generate_question(
     db.add(new_q)
     db.commit()
     db.refresh(new_q)
-
     return new_q
 
 
-# ─── Answer Evaluation ───────────────────────────────────────────────────────
+# ─── Legacy: Single Answer Evaluation (kept for backward compat) ──────────────
 
 @app.post("/api/answers/evaluate", response_model=schemas.EvaluationResponse)
 def evaluate_answer(
@@ -366,7 +656,6 @@ def evaluate_answer(
     if not question:
         raise HTTPException(status_code=404, detail="Question not found")
 
-    # Evaluate using AI Service
     eval_result = ai_service.evaluate_answer(
         japanese=question.japanese_text,
         expected_english=question.expected_english_text,
@@ -374,20 +663,21 @@ def evaluate_answer(
         grammar_point=question.grammar_point
     )
 
-    # Create attempt record with chapter_id and grammar_point
     attempt = models.Attempt(
         user_id=user.id,
         question_id=question.id,
+        lesson_id=submit.lesson_id,
         user_answer=submit.user_answer,
         is_correct=eval_result.is_correct,
         ai_feedback=eval_result.feedback_text,
+        alternative_expressions=json.dumps(eval_result.alternative_expressions, ensure_ascii=False),
+        naturalness_tips=json.dumps(eval_result.naturalness_tips, ensure_ascii=False),
         score=eval_result.score,
         grammar_point=question.grammar_point,
         chapter_id=question.chapter_id,
     )
     db.add(attempt)
 
-    # Update chapter-level proficiency
     if question.chapter_id:
         progress = db.query(models.UserChapterProgress).filter(
             models.UserChapterProgress.user_id == user.id,
@@ -399,8 +689,7 @@ def evaluate_answer(
             if eval_result.is_correct:
                 progress.correct_attempts += 1
 
-            # Exponential moving average for chapter score
-            alpha = 0.3  # Weight for new score
+            alpha = 0.3
             progress.proficiency_score = round(
                 (1 - alpha) * progress.proficiency_score + alpha * eval_result.score, 1
             )
@@ -408,13 +697,10 @@ def evaluate_answer(
 
     db.commit()
 
-    # Check mastery and unlock next chapter
     if question.chapter_id:
         check_chapter_mastery(user.id, question.chapter_id, db)
 
-    # Update overall proficiency
     update_overall_proficiency(user, db)
-
     return eval_result
 
 
@@ -427,7 +713,6 @@ def get_user_stats(
 ):
     ensure_chapter_progress(user, db)
 
-    # Overall stats
     all_attempts = db.query(models.Attempt).filter(
         models.Attempt.user_id == user.id
     ).all()
@@ -437,7 +722,6 @@ def get_user_stats(
         (correct_attempts / total_attempts * 100) if total_attempts > 0 else 0, 1
     )
 
-    # Chapter progress
     chapters = db.query(models.Chapter).order_by(models.Chapter.number).all()
     progress_map = {
         p.chapter_id: p for p in
@@ -469,11 +753,15 @@ def get_user_stats(
             accuracy_rate=acc,
         ))
 
-    # Determine overall level
-    score = user.proficiency_score
-    if score >= 70:
+    # Improved level determination: based on chapters mastered AND score
+    # Prevents "Advanced" from appearing after just 1 chapter
+    mastered_count = chapters_mastered
+    total_chapters = len(chapters)
+    avg_score = user.proficiency_score
+
+    if mastered_count >= 7 and avg_score >= 70:
         overall_level = "Advanced"
-    elif score >= 40:
+    elif mastered_count >= 3 and avg_score >= 50:
         overall_level = "Intermediate"
     else:
         overall_level = "Beginner"
@@ -484,14 +772,13 @@ def get_user_stats(
         weak = get_weak_points(user.id, ch.id, db)
         all_chapter_weak.extend(weak)
 
-    # Deduplicate and sort
     seen = set()
     unique_weak = []
     for w in sorted(all_chapter_weak, key=lambda x: x.accuracy):
         if w.grammar_point not in seen:
             seen.add(w.grammar_point)
             unique_weak.append(w)
-    unique_weak = unique_weak[:5]  # Top 5 weakest
+    unique_weak = unique_weak[:5]
 
     return schemas.UserStatsResponse(
         overall_level=overall_level,
@@ -502,6 +789,99 @@ def get_user_stats(
         overall_accuracy=overall_accuracy,
         weak_points=unique_weak,
         chapter_progress=chapter_responses,
+    )
+
+
+# ─── Skill Report ────────────────────────────────────────────────────────────
+
+@app.get("/api/users/me/report", response_model=schemas.SkillReport)
+def get_skill_report(
+    db: Session = Depends(database.get_db),
+    user: models.User = Depends(auth.get_current_user)
+):
+    """
+    Returns a detailed skill report analyzing grammar point performance
+    across all chapters. Used in the profile page.
+    """
+    ensure_chapter_progress(user, db)
+
+    chapters = db.query(models.Chapter).order_by(models.Chapter.number).all()
+    progress_map = {
+        p.chapter_id: p for p in
+        db.query(models.UserChapterProgress).filter(
+            models.UserChapterProgress.user_id == user.id
+        ).all()
+    }
+
+    # Build per-grammar-point stats across all chapters
+    attempts = db.query(models.Attempt).filter(
+        models.Attempt.user_id == user.id,
+        models.Attempt.grammar_point.isnot(None)
+    ).all()
+
+    gp_to_chapter: dict[str, str] = {}
+    for ch in chapters:
+        for gp in [g.strip() for g in ch.grammar_points.split(",")]:
+            gp_to_chapter[gp] = ch.title
+
+    gp_stats: dict[str, dict] = defaultdict(lambda: {"total": 0, "correct": 0})
+    for a in attempts:
+        if a.grammar_point:
+            gp_stats[a.grammar_point]["total"] += 1
+            if a.is_correct:
+                gp_stats[a.grammar_point]["correct"] += 1
+
+    # Build skill list
+    all_skills = []
+    for gp, stats in gp_stats.items():
+        if stats["total"] < 2:
+            continue  # Skip grammar points with too few data points
+        accuracy = round(stats["correct"] / stats["total"] * 100, 1)
+        all_skills.append(schemas.GrammarSkill(
+            grammar_point=gp,
+            attempts=stats["total"],
+            accuracy=accuracy,
+            chapter_title=gp_to_chapter.get(gp, "不明"),
+        ))
+
+    # Sort: strong = high accuracy, weak = low accuracy
+    all_skills.sort(key=lambda s: s.accuracy, reverse=True)
+    strong_skills = all_skills[:3]
+    weak_skills = list(reversed(all_skills[-3:])) if len(all_skills) >= 3 else list(reversed(all_skills))
+
+    # Chapter scores for radar chart
+    chapter_scores = []
+    for ch in chapters:
+        p = progress_map.get(ch.id)
+        chapter_scores.append({
+            "chapter_title": ch.title,
+            "chapter_number": ch.number,
+            "score": round(p.proficiency_score, 1) if p else 0.0,
+            "status": p.status if p else "locked",
+        })
+
+    # AI-generated summary (brief analysis of the user's skill profile)
+    if all_skills:
+        strong_list = ", ".join([s.grammar_point for s in strong_skills]) if strong_skills else "なし"
+        weak_list = ", ".join([s.grammar_point for s in weak_skills]) if weak_skills else "なし"
+        total_attempts_count = sum(s.attempts for s in all_skills)
+        overall_accuracy = round(
+            sum(s.accuracy * s.attempts for s in all_skills) / total_attempts_count, 1
+        ) if total_attempts_count > 0 else 0
+
+        ai_summary = (
+            f"総合正答率 {overall_accuracy}%（{total_attempts_count}問回答済み）。"
+            f"得意な文法: {strong_list}。"
+            f"苦手な文法: {weak_list}。"
+        )
+    else:
+        ai_summary = "まだ十分なデータがありません。レッスンを始めてスキルレポートを育てましょう！"
+
+    return schemas.SkillReport(
+        strong_skills=strong_skills,
+        weak_skills=weak_skills,
+        chapter_scores=chapter_scores,
+        ai_summary=ai_summary,
     )
 
 
