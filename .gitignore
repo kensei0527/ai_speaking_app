@@ -1,0 +1,23 @@
+# macOS
+.DS_Store
+
+# Backend
+backend/venv/
+backend/__pycache__/
+backend/.env
+backend/.env.*
+backend/*.db
+backend/*.sqlite3
+
+# Frontend
+frontend/node_modules/
+frontend/.next/
+frontend/out/
+frontend/build/
+frontend/.env
+frontend/.env.*
+frontend/.vercel/
+
+# IDE/Editors
+.vscode/
+.idea/
