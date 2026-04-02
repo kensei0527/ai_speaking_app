@@ -61,10 +61,11 @@ def startup_seed():
         except Exception:
             db.rollback()
 
-        count = db.query(models.Chapter).count()
-        if count == 0:
-            from seed_chapters import seed
-            seed()
+        # Vercelでのタイムアウトを避けるため、自動シードは無効化（手動実行を推奨）
+        # count = db.query(models.Chapter).count()
+        # if count == 0:
+        #     from seed_chapters import seed
+        #     seed()
     finally:
         db.close()
 

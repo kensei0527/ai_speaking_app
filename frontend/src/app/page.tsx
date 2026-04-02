@@ -2,6 +2,7 @@
 
 import { useEffect, useState } from "react";
 import Link from "next/link";
+import Image from "next/image";
 import {
   Brain,
   Trophy,
@@ -160,8 +161,8 @@ export default function Dashboard() {
         className="w-full max-w-5xl flex justify-between items-center mb-10"
       >
         <div className="flex items-center gap-3">
-          <div className="p-2.5 bg-gradient-to-br from-indigo-500 to-purple-500 rounded-xl text-white shadow-lg">
-            <Brain size={26} />
+          <div className="p-1 bg-white dark:bg-slate-800 rounded-xl shadow-sm border border-slate-100 dark:border-slate-700">
+            <Image src="/logo.png" alt="Logo" width={40} height={40} className="rounded-lg" />
           </div>
           <h1 className="text-2xl font-bold tracking-tight text-slate-800 dark:text-white">
             AI{" "}

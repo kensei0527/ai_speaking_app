@@ -5,6 +5,7 @@ import { motion } from 'framer-motion'
 import { createClient } from '@/utils/supabase/client'
 import { useRouter } from 'next/navigation'
 import Link from 'next/link'
+import Image from 'next/image'
 import { Sparkles, ArrowRight, Mail, Lock, Loader2 } from 'lucide-react'
 
 export default function LoginPage() {
@@ -49,8 +50,10 @@ export default function LoginPage() {
         className="w-full max-w-md p-8 relative z-10"
       >
         <div className="bg-white/5 backdrop-blur-2xl border border-white/10 rounded-3xl p-6 sm:p-8 shadow-2xl">
-          <div className="flex justify-center mb-6 text-blue-400">
-            <Sparkles className="w-12 h-12" />
+          <div className="flex justify-center mb-6">
+            <div className="p-2 bg-white/10 rounded-2xl border border-white/10 backdrop-blur-sm shadow-xl">
+              <Image src="/logo.png" alt="Logo" width={64} height={64} className="rounded-xl" />
+            </div>
           </div>
           <h2 className="text-3xl font-extrabold text-white text-center mb-2">
             Welcome back
