@@ -688,6 +688,7 @@ def complete_lesson(
             user_answer=answer_item.user_answer,
             is_correct=eval_result.is_correct,
             score=eval_result.score,
+            evaluation_level=eval_result.evaluation_level,
             feedback_text=eval_result.feedback_text,
             expected_english=eval_result.expected_english,
             grammar_point=eval_result.grammar_point,

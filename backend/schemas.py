@@ -159,6 +159,7 @@ class LessonAnswerResult(BaseModel):
     user_answer: str
     is_correct: bool
     score: float
+    evaluation_level: str
     feedback_text: str
     expected_english: str
     grammar_point: str
