@@ -62,6 +62,7 @@ interface AnswerResult {
   user_answer: string;
   is_correct: boolean;
   score: number;
+  evaluation_level: string;
   feedback_text: string;
   expected_english: string;
   grammar_point: string;
@@ -347,10 +348,20 @@ function ResultCard({
       <div className="flex items-start gap-3 mb-4">
         <div
           className={`p-2 rounded-xl text-white flex-shrink-0 ${
-            result.is_correct ? "bg-emerald-500" : "bg-rose-500"
+            result.evaluation_level === "Perfect" || result.evaluation_level === "Great"
+              ? "bg-emerald-500"
+              : result.evaluation_level === "Good"
+              ? "bg-amber-500"
+              : "bg-rose-500"
           }`}
         >
-          {result.is_correct ? <CheckCircle2 size={20} /> : <XCircle size={20} />}
+          {result.evaluation_level === "Perfect" || result.evaluation_level === "Great" ? (
+            <CheckCircle2 size={20} />
+          ) : result.evaluation_level === "Good" ? (
+            <Target size={20} />
+          ) : (
+            <XCircle size={20} />
+          )}
         </div>
         <div className="flex-1 min-w-0">
           <p className="font-bold text-slate-800 dark:text-white text-sm mb-0.5">
@@ -359,11 +370,17 @@ function ResultCard({
           <div className="flex items-center gap-3 text-xs text-slate-500">
             <span>{result.grammar_point}</span>
             <span
-              className={`font-bold ${
-                result.score >= 80 ? "text-emerald-600" : result.score >= 60 ? "text-amber-600" : "text-rose-600"
+              className={`font-bold px-2 py-0.5 rounded ${
+                result.evaluation_level === "Perfect"
+                  ? "bg-emerald-100 text-emerald-700 dark:bg-emerald-900/40 dark:text-emerald-300"
+                  : result.evaluation_level === "Great"
+                  ? "bg-teal-100 text-teal-700 dark:bg-teal-900/40 dark:text-teal-300"
+                  : result.evaluation_level === "Good"
+                  ? "bg-amber-100 text-amber-700 dark:bg-amber-900/40 dark:text-amber-300"
+                  : "bg-rose-100 text-rose-700 dark:bg-rose-900/40 dark:text-rose-300"
               }`}
             >
-              {result.score.toFixed(0)}点
+              {result.evaluation_level} ({result.score.toFixed(0)}点)
             </span>
           </div>
         </div>
@@ -414,9 +431,11 @@ function ResultCard({
 function ResultsPhase({
   lessonResult,
   chapterId,
+  startReviewLesson,
 }: {
   lessonResult: LessonResult;
   chapterId: string;
+  startReviewLesson: (mode: "weak" | "all") => void;
 }) {
   const accuracy = lessonResult.accuracy_rate;
   const isGreat = accuracy >= 80;
@@ -530,19 +549,38 @@ function ResultsPhase({
       </div>
 
       {/* Action buttons */}
-      <div className="flex flex-col sm:flex-row gap-3">
-        <Link href={`/chapters/${chapterId}`} className="flex-1">
-          <button className="w-full py-4 rounded-full font-bold text-slate-700 dark:text-slate-200 glass-panel hover:shadow-lg transition-all hover:-translate-y-0.5 flex items-center justify-center gap-2">
-            <ArrowLeft size={18} />
-            章の詳細へ
+      <div className="flex flex-col gap-3 mt-4">
+        <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+          <button 
+            onClick={() => startReviewLesson("weak")}
+            className="w-full py-4 rounded-full font-bold text-slate-700 dark:text-slate-200 glass-panel hover:shadow-lg transition-all hover:-translate-y-0.5 flex items-center justify-center gap-2"
+          >
+            <RotateCcw size={18} className="text-rose-500" />
+            間違えを復習する
           </button>
-        </Link>
-        <Link href="/" className="flex-1">
-          <button className="w-full py-4 rounded-full font-bold text-white bg-gradient-to-r from-indigo-600 to-purple-600 hover:shadow-lg transition-all hover:-translate-y-0.5 flex items-center justify-center gap-2">
-            <Home size={18} />
-            ダッシュボード
+          <button 
+            onClick={() => startReviewLesson("all")}
+            className="w-full py-4 rounded-full font-bold text-slate-700 dark:text-slate-200 glass-panel hover:shadow-lg transition-all hover:-translate-y-0.5 flex items-center justify-center gap-2"
+          >
+            <RotateCcw size={18} className="text-indigo-500" />
+            全問復習する
           </button>
-        </Link>
+        </div>
+
+        <div className="flex flex-col sm:flex-row gap-3">
+          <Link href={`/chapters/${chapterId}`} className="flex-1">
+            <button className="w-full py-4 rounded-full font-bold text-slate-700 dark:text-slate-200 glass-panel hover:shadow-lg transition-all hover:-translate-y-0.5 flex items-center justify-center gap-2 hover:bg-slate-50 dark:hover:bg-slate-800">
+              <ArrowLeft size={18} />
+              章の詳細へ戻る
+            </button>
+          </Link>
+          <Link href="/" className="flex-1">
+            <button className="w-full py-4 rounded-full font-bold text-white bg-gradient-to-r from-indigo-600 to-purple-600 hover:shadow-lg transition-all hover:-translate-y-0.5 flex items-center justify-center gap-2">
+              <Home size={18} />
+              ダッシュボード
+            </button>
+          </Link>
+        </div>
       </div>
     </motion.div>
   );
@@ -593,21 +631,48 @@ function PracticeContent() {
     fetchChapter();
   }, [chapterId]);
 
-  // Start lesson (generate questions in batch)
+  // Start lesson
   useEffect(() => {
     if (!chapterId) return;
+    
+    // Only auto-start on load if we don't have a lesson yet
+    if (lesson !== null) return;
+    
     const startLesson = async () => {
       const session = await getSession();
       if (!session) return;
+      
+      const scenarioId = searchParams.get("scenario");
+      const reviewLessonId = searchParams.get("review_from");
+      const reviewMode = searchParams.get("review_mode");
+
       try {
-        const res = await fetch(`${API_URL}/api/lessons/start`, {
-          method: "POST",
-          headers: {
-            "Content-Type": "application/json",
-            Authorization: `Bearer ${session.access_token}`,
-          },
-          body: JSON.stringify({ chapter_id: parseInt(chapterId) }),
-        });
+        let res;
+        if (reviewLessonId && reviewMode) {
+          // It's a review
+          res = await fetch(`${API_URL}/api/lessons/${reviewLessonId}/review`, {
+            method: "POST",
+            headers: {
+              "Content-Type": "application/json",
+              Authorization: `Bearer ${session.access_token}`,
+            },
+            body: JSON.stringify({ mode: reviewMode }),
+          });
+        } else if (scenarioId) {
+          // Standard scenario start
+          res = await fetch(`${API_URL}/api/lessons/start`, {
+            method: "POST",
+            headers: {
+              "Content-Type": "application/json",
+              Authorization: `Bearer ${session.access_token}`,
+            },
+            body: JSON.stringify({ scenario_id: parseInt(scenarioId) }),
+          });
+        } else {
+           console.error("Neither scenario_id nor review_lesson_id provided");
+           return;
+        }
+
         if (!res.ok) throw new Error("Failed to start lesson");
         const data: LessonData = await res.json();
         setLesson(data);
@@ -617,7 +682,7 @@ function PracticeContent() {
       }
     };
     startLesson();
-  }, [chapterId]);
+  }, [chapterId, searchParams, lesson]);
 
   const handleAnswerSubmitted = (questionId: number, userAnswer: string) => {
     const newAnswers = [...answers, { question_id: questionId, user_answer: userAnswer }];
@@ -714,6 +779,20 @@ function PracticeContent() {
               key="results"
               lessonResult={lessonResult}
               chapterId={chapterId}
+              startReviewLesson={async (mode) => {
+                const url = new URL(window.location.href);
+                url.searchParams.set("review_from", lessonResult.lesson_id.toString());
+                url.searchParams.set("review_mode", mode);
+                url.searchParams.delete("scenario"); // clean up
+                window.history.pushState({}, "", url.toString());
+                
+                // Reset states to run effect again
+                setLesson(null);
+                setAnswers([]);
+                setCurrentIndex(0);
+                setLessonResult(null);
+                setPhase("loading");
+              }}
             />
           )}
         </AnimatePresence>

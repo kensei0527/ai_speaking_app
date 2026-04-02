@@ -52,9 +52,25 @@ class RecentAttemptInfo(BaseModel):
     created_at: datetime
 
 
+class ScenarioResponse(BaseModel):
+    id: int
+    chapter_id: int
+    title: str
+    description: Optional[str] = None
+    order_index: int
+    # User progress fields
+    status: str = "locked"  # locked / available / completed
+    proficiency_score: float = 0.0
+    total_attempts: int = 0
+    correct_attempts: int = 0
+
+    model_config = ConfigDict(from_attributes=True)
+
+
 class ChapterDetailResponse(ChapterResponse):
     weak_grammar_points: List[WeakPointInfo] = []
     recent_attempts: List[RecentAttemptInfo] = []
+    scenarios: List[ScenarioResponse] = []
 
 
 # Question Schemas
@@ -72,6 +88,7 @@ class QuestionCreate(QuestionBase):
 class QuestionResponse(QuestionBase):
     id: int
     chapter_id: Optional[int] = None
+    scenario_id: Optional[int] = None
     created_at: datetime
     model_config = ConfigDict(from_attributes=True)
 
@@ -86,6 +103,7 @@ class AnswerSubmit(BaseModel):
 class EvaluationResponse(BaseModel):
     is_correct: bool
     score: float
+    evaluation_level: str                         # ✨ "Perfect", "Great", "Good", "Try Again"
     feedback_text: str
     expected_english: str
     grammar_point: str
@@ -96,7 +114,7 @@ class EvaluationResponse(BaseModel):
 # ─── Lesson Schemas ───────────────────────────────────────────────────────────
 
 class LessonStartRequest(BaseModel):
-    chapter_id: int
+    scenario_id: int
 
 
 class LessonQuestionInfo(BaseModel):
@@ -113,6 +131,8 @@ class LessonQuestionInfo(BaseModel):
 class LessonResponse(BaseModel):
     lesson_id: int
     chapter_id: int
+    scenario_id: Optional[int] = None
+    is_review: bool = False
     questions: List[LessonQuestionInfo]
     total_questions: int
 
@@ -122,6 +142,10 @@ class LessonResponse(BaseModel):
 class LessonAnswerItem(BaseModel):
     question_id: int
     user_answer: str
+
+
+class LessonReviewRequest(BaseModel):
+    mode: str = "weak"  # "weak" (<= 50 score) or "all"
 
 
 class LessonCompleteRequest(BaseModel):
@@ -145,6 +169,7 @@ class LessonAnswerResult(BaseModel):
 class LessonCompleteResponse(BaseModel):
     lesson_id: int
     chapter_id: int
+    scenario_id: Optional[int] = None
     total_questions: int
     correct_count: int
     accuracy_rate: float

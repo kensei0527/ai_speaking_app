@@ -71,12 +71,20 @@ def startup_seed():
 
 # ─── Helper: ensure user has chapter progress rows ──────────────────────────
 def ensure_chapter_progress(user: models.User, db: Session):
-    """Create UserChapterProgress rows for any chapters the user doesn't have yet."""
+    """Create UserChapterProgress and UserScenarioProgress rows for any chapters/scenarios the user doesn't have yet."""
     chapters = db.query(models.Chapter).all()
+    # Check chapter progress
     existing_chapter_ids = {
         p.chapter_id for p in
         db.query(models.UserChapterProgress).filter(
             models.UserChapterProgress.user_id == user.id
+        ).all()
+    }
+    # Check scenario progress
+    existing_scenario_ids = {
+        p.scenario_id for p in
+        db.query(models.UserScenarioProgress).filter(
+            models.UserScenarioProgress.user_id == user.id
         ).all()
     }
 
@@ -90,6 +98,18 @@ def ensure_chapter_progress(user: models.User, db: Session):
                 status=status,
             )
             db.add(progress)
+
+        scenarios = db.query(models.Scenario).filter(models.Scenario.chapter_id == ch.id).all()
+        for sc in scenarios:
+            if sc.id not in existing_scenario_ids:
+                # If chapter 1, its scenarios are available
+                sc_status = "available" if ch.number == 1 else "locked"
+                sc_progress = models.UserScenarioProgress(
+                    user_id=user.id,
+                    scenario_id=sc.id,
+                    status=sc_status,
+                )
+                db.add(sc_progress)
 
     db.commit()
 
@@ -129,13 +149,27 @@ def get_weak_points(user_id: str, chapter_id: int, db: Session) -> list[schemas.
 
 
 # ─── Helper: check and unlock next chapter ───────────────────────────────────
+def check_scenario_mastery(user_id: str, scenario_id: int, db: Session) -> bool:
+    """Check if a scenario is mastered (score >= 80)."""
+    progress = db.query(models.UserScenarioProgress).filter(
+        models.UserScenarioProgress.user_id == user_id,
+        models.UserScenarioProgress.scenario_id == scenario_id
+    ).first()
+    
+    if not progress or progress.status == "mastered":
+        return False
+        
+    if progress.proficiency_score >= 80 and progress.total_attempts >= 5:
+        progress.status = "mastered"
+        db.commit()
+        return True
+    return False
+
+
 def check_chapter_mastery(user_id: str, chapter_id: int, db: Session) -> dict:
     """
     Check if a chapter should be marked as mastered and unlock next.
-    Mastery conditions (improved):
-    - score >= 80
-    - total_attempts >= 20
-    - Each grammar point attempted at least twice
+    Mastery condition: All scenarios in the chapter must be "mastered" (score >= 80)
     Returns dict with mastered and next_chapter_unlocked flags.
     """
     result = {"mastered": False, "next_chapter_unlocked": False}
@@ -148,50 +182,56 @@ def check_chapter_mastery(user_id: str, chapter_id: int, db: Session) -> dict:
     if not progress or progress.status == "mastered":
         return result
 
-    # Get the chapter to know its grammar points
     chapter = db.query(models.Chapter).filter(models.Chapter.id == chapter_id).first()
     if not chapter:
         return result
 
-    grammar_points = [gp.strip() for gp in chapter.grammar_points.split(",")]
-
-    # Check: score >= 80 AND total_attempts >= 20
-    if progress.proficiency_score < 80 or progress.total_attempts < 20:
+    scenarios = db.query(models.Scenario).filter(models.Scenario.chapter_id == chapter_id).all()
+    if not scenarios:
         return result
 
-    # Check: each grammar point attempted at least twice
-    attempts = db.query(models.Attempt).filter(
-        models.Attempt.user_id == user_id,
-        models.Attempt.chapter_id == chapter_id,
-        models.Attempt.grammar_point.isnot(None)
-    ).all()
+    # Check if all scenarios are mastered
+    all_mastered = True
+    for sc in scenarios:
+        sc_prog = db.query(models.UserScenarioProgress).filter(
+            models.UserScenarioProgress.user_id == user_id,
+            models.UserScenarioProgress.scenario_id == sc.id
+        ).first()
+        if not sc_prog or sc_prog.status != "mastered":
+            all_mastered = False
+            break
 
-    gp_count = defaultdict(int)
-    for a in attempts:
-        if a.grammar_point:
-            gp_count[a.grammar_point] += 1
-
-    # All grammar points must have been attempted at least twice
-    all_covered = all(gp_count.get(gp, 0) >= 2 for gp in grammar_points)
-    if not all_covered:
+    if not all_mastered:
         return result
 
     # Mark as mastered
     progress.status = "mastered"
     result["mastered"] = True
 
-    # Unlock next chapter
+    # Unlock next chapter and its scenarios
     next_chapter = db.query(models.Chapter).filter(
         models.Chapter.number == chapter.number + 1
     ).first()
+    
     if next_chapter:
         next_progress = db.query(models.UserChapterProgress).filter(
             models.UserChapterProgress.user_id == user_id,
             models.UserChapterProgress.chapter_id == next_chapter.id
         ).first()
+        
         if next_progress and next_progress.status == "locked":
             next_progress.status = "available"
             result["next_chapter_unlocked"] = True
+            
+            # Unlock scenarios for next chapter
+            next_scenarios = db.query(models.Scenario).filter(models.Scenario.chapter_id == next_chapter.id).all()
+            for n_sc in next_scenarios:
+                n_sc_prog = db.query(models.UserScenarioProgress).filter(
+                    models.UserScenarioProgress.user_id == user_id,
+                    models.UserScenarioProgress.scenario_id == n_sc.id
+                ).first()
+                if n_sc_prog and n_sc_prog.status == "locked":
+                    n_sc_prog.status = "available"
 
     db.commit()
     return result
@@ -327,6 +367,26 @@ def get_chapter_detail(
             created_at=a.created_at,
         ))
 
+    # Get Scenarios
+    scenarios_db = db.query(models.Scenario).filter(models.Scenario.chapter_id == chapter_id).order_by(models.Scenario.order_index).all()
+    scenario_responses = []
+    for sc in scenarios_db:
+        sc_prog = db.query(models.UserScenarioProgress).filter(
+            models.UserScenarioProgress.user_id == user.id,
+            models.UserScenarioProgress.scenario_id == sc.id
+        ).first()
+        scenario_responses.append(schemas.ScenarioResponse(
+            id=sc.id,
+            chapter_id=sc.chapter_id,
+            title=sc.title,
+            description=sc.description,
+            order_index=sc.order_index,
+            status=sc_prog.status if sc_prog else "locked",
+            proficiency_score=round(sc_prog.proficiency_score, 1) if sc_prog else 0.0,
+            total_attempts=sc_prog.total_attempts if sc_prog else 0,
+            correct_attempts=sc_prog.correct_attempts if sc_prog else 0,
+        ))
+
     return schemas.ChapterDetailResponse(
         id=chapter.id,
         number=chapter.number,
@@ -340,6 +400,7 @@ def get_chapter_detail(
         accuracy_rate=accuracy,
         weak_grammar_points=weak_points,
         recent_attempts=recent_attempts,
+        scenarios=scenario_responses,
     )
 
 
@@ -352,89 +413,58 @@ def start_lesson(
     user: models.User = Depends(auth.get_current_user)
 ):
     """
-    Start a new lesson for a chapter.
-    Generates all questions at once (batch) and returns them.
-    Lesson size is determined by the number of grammar points in the chapter.
+    Start a new lesson based on a predefined scenario.
+    Pools predefined questions from the database instead of asking AI.
     """
     ensure_chapter_progress(user, db)
 
-    chapter = db.query(models.Chapter).filter(models.Chapter.id == req.chapter_id).first()
-    if not chapter:
-        raise HTTPException(status_code=404, detail="Chapter not found")
+    scenario = db.query(models.Scenario).filter(models.Scenario.id == req.scenario_id).first()
+    if not scenario:
+        raise HTTPException(status_code=404, detail="Scenario not found")
+        
+    chapter_id = scenario.chapter_id
 
     # Check access
-    progress = db.query(models.UserChapterProgress).filter(
-        models.UserChapterProgress.user_id == user.id,
-        models.UserChapterProgress.chapter_id == req.chapter_id
+    sc_progress = db.query(models.UserScenarioProgress).filter(
+        models.UserScenarioProgress.user_id == user.id,
+        models.UserScenarioProgress.scenario_id == scenario.id
     ).first()
 
-    if progress and progress.status == "locked":
-        raise HTTPException(status_code=403, detail="This chapter is still locked.")
+    if sc_progress and sc_progress.status == "locked":
+        raise HTTPException(status_code=403, detail="This scenario is still locked.")
 
-    # Mark as in_progress
-    if progress and progress.status == "available":
-        progress.status = "in_progress"
-        db.commit()
+    # Mark as in_progress if chapter was just available
+    ch_progress = db.query(models.UserChapterProgress).filter(
+        models.UserChapterProgress.user_id == user.id,
+        models.UserChapterProgress.chapter_id == chapter_id
+    ).first()
+    if ch_progress and ch_progress.status == "available":
+        ch_progress.status = "in_progress"
 
-    # Calculate lesson size (Case C: based on grammar points)
-    lesson_size = calc_lesson_size(chapter.grammar_points)
-
-    # Get user history for smarter generation
-    recent_attempts = db.query(models.Attempt).filter(
-        models.Attempt.user_id == user.id,
-        models.Attempt.chapter_id == req.chapter_id
-    ).order_by(models.Attempt.created_at.desc()).limit(10).all()
-
-    user_history = [
-        {
-            "grammar_point": a.grammar_point or "不明",
-            "is_correct": a.is_correct,
-            "user_answer": a.user_answer,
-        }
-        for a in recent_attempts
-    ]
-
-    weak_point_infos = get_weak_points(user.id, req.chapter_id, db)
-    weak_point_names = [wp.grammar_point for wp in weak_point_infos]
-
-    chapter_score = progress.proficiency_score if progress else 0.0
-
-    # Generate all questions at once (single AI call)
-    q_data_list = ai_service.generate_questions_batch(
-        chapter_title=chapter.title,
-        chapter_grammar_points=chapter.grammar_points,
-        cefr_level=chapter.cefr_level,
-        proficiency_score=chapter_score,
-        count=lesson_size,
-        user_history=user_history if user_history else None,
-        weak_points=weak_point_names if weak_point_names else None,
-    )
-
-    # Save questions to DB
-    saved_questions = []
-    for q_data in q_data_list:
-        new_q = models.Question(
-            japanese_text=q_data.japanese_text,
-            expected_english_text=q_data.expected_english_text,
-            grammar_point=q_data.grammar_point,
-            difficulty=q_data.difficulty,
-            chapter_id=chapter.id,
-        )
-        db.add(new_q)
-        db.flush()  # Get the ID without committing
-        saved_questions.append(new_q)
+    # Get predefined questions from DB (shuffle them)
+    questions_query = db.query(models.Question).filter(models.Question.scenario_id == scenario.id).all()
+    if not questions_query:
+        raise HTTPException(status_code=404, detail="No questions found for this scenario.")
+        
+    import random
+    random.shuffle(questions_query)
+    
+    # Pick top 10 or max available
+    lesson_size = min(10, len(questions_query))
+    selected_questions = questions_query[:lesson_size]
 
     # Create Lesson record
     lesson = models.Lesson(
         user_id=user.id,
-        chapter_id=chapter.id,
-        total_questions=len(saved_questions),
+        chapter_id=chapter_id,
+        scenario_id=scenario.id,
+        total_questions=lesson_size,
     )
     db.add(lesson)
     db.flush()
 
     # Create LessonQuestion junction records
-    for idx, q in enumerate(saved_questions):
+    for idx, q in enumerate(selected_questions):
         lq = models.LessonQuestion(
             lesson_id=lesson.id,
             question_id=q.id,
@@ -460,9 +490,93 @@ def start_lesson(
 
     return schemas.LessonResponse(
         lesson_id=lesson.id,
-        chapter_id=chapter.id,
+        chapter_id=chapter_id,
+        scenario_id=lesson.scenario_id,
+        is_review=lesson.is_review,
         questions=question_infos,
         total_questions=lesson.total_questions,
+    )
+
+
+@app.post("/api/lessons/{lesson_id}/review", response_model=schemas.LessonResponse)
+def review_lesson(
+    lesson_id: int,
+    req: schemas.LessonReviewRequest,
+    db: Session = Depends(database.get_db),
+    user: models.User = Depends(auth.get_current_user)
+):
+    """
+    Creates a new review lesson from a previous lesson.
+    mode='weak': Only questions with score < 60
+    mode='all': All questions from the previous lesson
+    """
+    old_lesson = db.query(models.Lesson).filter(
+        models.Lesson.id == lesson_id,
+        models.Lesson.user_id == user.id
+    ).first()
+    
+    if not old_lesson:
+        raise HTTPException(status_code=404, detail="Previous lesson not found")
+        
+    old_lqs = db.query(models.LessonQuestion).filter(models.LessonQuestion.lesson_id == old_lesson.id).all()
+    q_ids_to_review = []
+    
+    if req.mode == "weak":
+        # Find which questions the user got poorly on in the previous lesson
+        attempts = db.query(models.Attempt).filter(models.Attempt.lesson_id == old_lesson.id).all()
+        weak_q_ids = [a.question_id for a in attempts if a.score < 60]
+        q_ids_to_review = weak_q_ids
+    else:
+        q_ids_to_review = [lq.question_id for lq in old_lqs]
+        
+    if not q_ids_to_review:
+        raise HTTPException(status_code=400, detail="No questions to review in this mode")
+        
+    # Create new review lesson
+    new_lesson = models.Lesson(
+        user_id=user.id,
+        chapter_id=old_lesson.chapter_id,
+        scenario_id=old_lesson.scenario_id,
+        is_review=True,
+        total_questions=len(q_ids_to_review)
+    )
+    db.add(new_lesson)
+    db.flush()
+    
+    import random
+    random.shuffle(q_ids_to_review)
+    
+    for idx, q_id in enumerate(q_ids_to_review):
+        lq = models.LessonQuestion(
+            lesson_id=new_lesson.id,
+            question_id=q_id,
+            order_index=idx
+        )
+        db.add(lq)
+        
+    db.commit()
+    db.refresh(new_lesson)
+    
+    # Build response
+    question_infos = []
+    for lq in new_lesson.questions:
+        q = db.query(models.Question).filter(models.Question.id == lq.question_id).first()
+        question_infos.append(schemas.LessonQuestionInfo(
+            id=q.id,
+            japanese_text=q.japanese_text,
+            expected_english_text=q.expected_english_text,
+            grammar_point=q.grammar_point,
+            difficulty=q.difficulty,
+            order_index=lq.order_index,
+        ))
+
+    return schemas.LessonResponse(
+        lesson_id=new_lesson.id,
+        chapter_id=new_lesson.chapter_id,
+        scenario_id=new_lesson.scenario_id,
+        is_review=new_lesson.is_review,
+        questions=question_infos,
+        total_questions=new_lesson.total_questions,
     )
 
 
@@ -527,6 +641,23 @@ def complete_lesson(
         )
         db.add(attempt)
 
+        # Update scenario progress
+        if lesson.scenario_id:
+            sc_progress = db.query(models.UserScenarioProgress).filter(
+                models.UserScenarioProgress.user_id == user.id,
+                models.UserScenarioProgress.scenario_id == lesson.scenario_id
+            ).first()
+            if sc_progress:
+                sc_progress.total_attempts += 1
+                if eval_result.is_correct:
+                    sc_progress.correct_attempts += 1
+                
+                # EMA for scenario score
+                alpha = 0.3
+                sc_progress.proficiency_score = round(
+                    (1 - alpha) * sc_progress.proficiency_score + alpha * eval_result.score, 1
+                )
+
         # Update chapter progress
         if question.chapter_id:
             progress = db.query(models.UserChapterProgress).filter(
@@ -538,8 +669,8 @@ def complete_lesson(
                 if eval_result.is_correct:
                     progress.correct_attempts += 1
 
-                # Exponential moving average for chapter score
-                alpha = 0.3
+                # Weighted updates for chapter score
+                alpha = 0.1 # less weight for overall chapter score per attempt
                 progress.proficiency_score = round(
                     (1 - alpha) * progress.proficiency_score + alpha * eval_result.score, 1
                 )
@@ -566,6 +697,8 @@ def complete_lesson(
     db.commit()
 
     # Check mastery
+    if lesson.scenario_id:
+        check_scenario_mastery(user.id, lesson.scenario_id, db)
     mastery_result = check_chapter_mastery(user.id, lesson.chapter_id, db)
 
     # Update overall proficiency
@@ -586,6 +719,7 @@ def complete_lesson(
     return schemas.LessonCompleteResponse(
         lesson_id=lesson.id,
         chapter_id=lesson.chapter_id,
+        scenario_id=lesson.scenario_id,
         total_questions=answered_count,
         correct_count=correct_count,
         accuracy_rate=accuracy,

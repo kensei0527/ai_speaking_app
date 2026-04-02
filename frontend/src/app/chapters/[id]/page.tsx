@@ -38,6 +38,18 @@ interface RecentAttempt {
   created_at: string;
 }
 
+interface ScenarioResponse {
+  id: number;
+  chapter_id: number;
+  title: string;
+  description: string;
+  order_index: number;
+  status: string;
+  proficiency_score: number;
+  total_attempts: number;
+  correct_attempts: number;
+}
+
 interface ChapterDetail {
   id: number;
   number: number;
@@ -51,6 +63,7 @@ interface ChapterDetail {
   accuracy_rate: number;
   weak_grammar_points: WeakPoint[];
   recent_attempts: RecentAttempt[];
+  scenarios: ScenarioResponse[];
 }
 
 const statusLabels: Record<string, { label: string; color: string }> = {
@@ -241,6 +254,59 @@ export default function ChapterDetailPage() {
           </motion.div>
         </div>
 
+        {/* ── Scenarios List ──────────────────────────────────────── */}
+        <motion.div
+           initial={{ opacity: 0, y: 20 }}
+           animate={{ opacity: 1, y: 0 }}
+           transition={{ delay: 0.28 }}
+           className="mb-8"
+        >
+          <div className="flex items-center gap-2 mb-4">
+            <Target size={20} className="text-indigo-500" />
+            <h2 className="text-xl font-bold text-slate-800 dark:text-white">シチュエーション一覧</h2>
+          </div>
+          <p className="text-sm text-slate-500 mb-6">この章には様々な場面が用意されています。すべての場面をマスターして次の章に進みましょう。</p>
+          
+          <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+            {chapter.scenarios && chapter.scenarios.map((sc, index) => {
+              const scStatus = statusLabels[sc.status] || statusLabels.locked;
+              const isLocked = sc.status === "locked";
+              return (
+                <div key={sc.id} className={`glass-panel p-5 rounded-2xl flex flex-col ${isLocked ? 'opacity-60' : ''}`}>
+                  <div className="flex items-start justify-between mb-2">
+                    <h3 className="font-bold text-slate-800 dark:text-white text-lg pr-4">{sc.title}</h3>
+                    <div className="flex items-center gap-2">
+                       {sc.status === "mastered" && <CheckCircle2 size={20} className="text-emerald-500 flex-shrink-0" />}
+                       {isLocked && <Lock size={16} className="text-slate-400 flex-shrink-0" />}
+                    </div>
+                  </div>
+                  <p className="text-sm text-slate-500 dark:text-slate-400 mb-4 flex-1">{sc.description}</p>
+                  
+                  <div className="flex items-end justify-between mt-auto pt-4 border-t border-slate-100 dark:border-slate-800">
+                    <div className="flex flex-col">
+                      <span className="text-xs text-slate-400">習熟度</span>
+                      <span className={`font-bold ${sc.status === "mastered" ? "text-emerald-500" : "text-indigo-500"}`}>
+                        {sc.proficiency_score.toFixed(0)} <span className="text-xs font-normal text-slate-400">/ 100</span>
+                      </span>
+                    </div>
+                    {!isLocked ? (
+                      <Link href={`/practice?chapter=${chapter.id}&scenario=${sc.id}`}>
+                        <button className="px-5 py-2 bg-gradient-to-r from-indigo-600 to-purple-600 hover:from-indigo-500 hover:to-purple-500 text-white text-sm font-bold rounded-full shadow-md hover:shadow-lg transition-all hover:-translate-y-0.5">
+                          {sc.status === "mastered" ? "復習する" : "練習する"}
+                        </button>
+                      </Link>
+                    ) : (
+                       <button disabled className="px-5 py-2 bg-slate-200 dark:bg-slate-700 text-slate-400 dark:text-slate-500 text-sm font-bold rounded-full cursor-not-allowed">
+                         ロック中
+                       </button>
+                    )}
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+        </motion.div>
+
         {/* ── Weak Points ──────────────────────────────────────── */}
         {chapter.weak_grammar_points.length > 0 && (
           <motion.div
@@ -317,30 +383,7 @@ export default function ChapterDetailPage() {
           </motion.div>
         )}
 
-        {/* ── Start Practice Button ────────────────────────────── */}
-        <motion.div
-          initial={{ opacity: 0, y: 20 }}
-          animate={{ opacity: 1, y: 0 }}
-          transition={{ delay: 0.4 }}
-          className="text-center pb-8"
-        >
-          {chapter.status !== "locked" ? (
-            <Link href={`/practice?chapter=${chapter.id}`} className="block sm:inline-block">
-              <button className="w-full sm:w-auto group inline-flex items-center justify-center px-8 sm:px-10 py-4 font-bold text-white transition-all duration-200 bg-gradient-to-r from-indigo-600 to-purple-600 rounded-full hover:from-indigo-500 hover:to-purple-500 hover:shadow-xl hover:-translate-y-1 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-indigo-600 text-base sm:text-lg">
-                <Sparkles className="w-5 h-5 mr-2 flex-shrink-0" />
-                <span className="truncate">{chapter.status === "mastered" ? "復習する" : "この章を練習する"}</span>
-                <ChevronRight className="w-5 h-5 ml-1 group-hover:translate-x-1 transition-transform flex-shrink-0" />
-              </button>
-            </Link>
-          ) : (
-            <div className="flex flex-col items-center gap-3">
-              <div className="p-4 bg-slate-100 dark:bg-slate-800 rounded-full">
-                <Lock size={32} className="text-slate-400" />
-              </div>
-              <p className="text-slate-400 font-medium">前の章をマスターするとアンロックされます</p>
-            </div>
-          )}
-        </motion.div>
+        {/* ── Main Start Button Removed (Using Per-Scenario Buttons) ────────────────────────────── */}
       </div>
     </div>
   );

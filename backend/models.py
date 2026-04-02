@@ -15,6 +15,7 @@ class User(Base):
 
     attempts = relationship("Attempt", back_populates="user")
     chapter_progress = relationship("UserChapterProgress", back_populates="user")
+    scenario_progress = relationship("UserScenarioProgress", back_populates="user")
     lessons = relationship("Lesson", back_populates="user")
 
 
@@ -30,6 +31,7 @@ class Chapter(Base):
     prerequisite_chapter = Column(Integer, nullable=True)   # Chapter number prerequisite (None for ch.1)
 
     questions = relationship("Question", back_populates="chapter")
+    scenarios = relationship("Scenario", back_populates="chapter")
 
 
 class UserChapterProgress(Base):
@@ -48,6 +50,34 @@ class UserChapterProgress(Base):
     chapter = relationship("Chapter")
 
 
+class Scenario(Base):
+    __tablename__ = "scenarios"
+
+    id = Column(Integer, primary_key=True, index=True)
+    chapter_id = Column(Integer, ForeignKey("chapters.id"), nullable=False)
+    title = Column(String, nullable=False)
+    description = Column(Text, nullable=True)
+    order_index = Column(Integer, default=0)
+
+    chapter = relationship("Chapter", back_populates="scenarios")
+    questions = relationship("Question", back_populates="scenario")
+
+
+class UserScenarioProgress(Base):
+    __tablename__ = "user_scenario_progress"
+
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(String, ForeignKey("users.id"), nullable=False)
+    scenario_id = Column(Integer, ForeignKey("scenarios.id"), nullable=False)
+    status = Column(String, default="locked")  # locked / available / completed
+    proficiency_score = Column(Float, default=0.0)
+    total_attempts = Column(Integer, default=0)
+    correct_attempts = Column(Integer, default=0)
+
+    user = relationship("User", back_populates="scenario_progress")
+    scenario = relationship("Scenario")
+
+
 class Question(Base):
     __tablename__ = "questions"
 
@@ -57,9 +87,11 @@ class Question(Base):
     grammar_point = Column(String, index=True)
     difficulty = Column(Integer, default=1)  # 1-5 scale
     chapter_id = Column(Integer, ForeignKey("chapters.id"), nullable=True)
+    scenario_id = Column(Integer, ForeignKey("scenarios.id"), nullable=True)
     created_at = Column(DateTime, default=datetime.datetime.utcnow)
 
     chapter = relationship("Chapter", back_populates="questions")
+    scenario = relationship("Scenario", back_populates="questions")
 
 
 class Attempt(Base):
@@ -91,13 +123,16 @@ class Lesson(Base):
     id = Column(Integer, primary_key=True, index=True)
     user_id = Column(String, ForeignKey("users.id"), nullable=False)
     chapter_id = Column(Integer, ForeignKey("chapters.id"), nullable=False)
+    scenario_id = Column(Integer, ForeignKey("scenarios.id"), nullable=True)
     status = Column(String, default="active")   # active / completed
+    is_review = Column(Boolean, default=False)  # True if this is a review session
     total_questions = Column(Integer, default=0)
     started_at = Column(DateTime, default=datetime.datetime.utcnow)
     completed_at = Column(DateTime, nullable=True)
 
     user = relationship("User", back_populates="lessons")
     chapter = relationship("Chapter")
+    scenario = relationship("Scenario")
     questions = relationship("LessonQuestion", back_populates="lesson", order_by="LessonQuestion.order_index")
     attempts = relationship("Attempt", back_populates="lesson")
 

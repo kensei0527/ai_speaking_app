@@ -284,7 +284,7 @@ def evaluate_answer(
 
     prompt = f"""
 You are an expert English teacher evaluating a student's answer in an "Instant English Composition" (瞬間英作文) exercise.
-This is a speaking-focused exercise, so naturalness and variety of expression are important.
+This is a speaking-focused exercise, so naturalness and whether the MEANING is conveyed are much more important than strict grammatical perfection.
 
 Task:
 Original Japanese: "{japanese}"
@@ -294,16 +294,23 @@ Model/Expected English Answer: "{expected_english}"
 Student's Answer: "{user_answer}"
 
 Analyze the student's answer focusing on:
-1. Correctness of meaning compared to the Japanese.
-2. Proper use of the target grammar point.
-3. Naturalness for spoken English.
+1. Meaning conveyance (Does a native speaker understand what they are trying to say?)
+2. Naturalness for spoken English.
+3. Proper use of the target grammar point (Secondary priority).
 
-If the student's answer is perfectly acceptable and natural, it can be marked correct even if it differs from the Expected English.
+Assign a score (0-100) and an `evaluation_level` based on these criteria:
+- Score 90-100 (Perfect): Grammatically correct and highly natural.
+- Score 70-89 (Great): There are minor grammatical errors, but the meaning is perfectly clear to a native speaker. This is a very good attempt for speaking!
+- Score 50-69 (Good): The meaning is somewhat conveyed, but it's unnatural or has noticeable grammar mistakes.
+- Score 0-49 (Try Again): The meaning is lost, highly confusing, or completely incorrect.
+
+Also output `is_correct`. Set `is_correct: true` if the score is 70 or above (meaning is perfectly clear).
 
 Output ONLY a JSON object with the following keys:
-"is_correct": <boolean: true if acceptable/correct, false if major errors>,
-"score": <number between 0 and 100 based on accuracy and naturalness>,
-"feedback_text": "A brief, encouraging explanation in Japanese. Point out what was good and any corrections needed. Keep it concise and clear.",
+"is_correct": <boolean: true if score >= 70, false otherwise>,
+"score": <number between 0 and 100>,
+"evaluation_level": <string: exactly one of "Perfect", "Great", "Good", "Try Again">,
+"feedback_text": "A brief, encouraging explanation in Japanese. Explain the evaluation level. If it's 'Great', praise them that the meaning was conveyed well. Keep it concise.",
 "alternative_expressions": ["2-3 other natural English ways to say the same thing. Focus on expressions useful for speaking."],
 "naturalness_tips": ["1-2 practical tips to make the expression sound more natural in conversation. Only include if genuinely useful, otherwise leave empty array."]
 """
@@ -322,6 +329,7 @@ Output ONLY a JSON object with the following keys:
         return EvaluationResponse(
             is_correct=data.get("is_correct", False),
             score=data.get("score", 0.0),
+            evaluation_level=data.get("evaluation_level", "Try Again"),
             feedback_text=data.get("feedback_text", "Could not analyze the answer."),
             expected_english=expected_english,
             grammar_point=grammar_point,
@@ -333,6 +341,7 @@ Output ONLY a JSON object with the following keys:
         return EvaluationResponse(
             is_correct=False,
             score=0,
+            evaluation_level="Try Again",
             feedback_text="サーバーエラーにより添削できませんでした。(Server Error)",
             expected_english=expected_english,
             grammar_point=grammar_point,
