@@ -19,7 +19,7 @@ from typing import Optional
 
 
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
-LIVE_API_MODEL = "gemini-2.0-flash-live-001"
+LIVE_API_MODEL = "gemini-3.1-flash-live-preview"
 LIVE_WS_URL = (
     f"wss://generativelanguage.googleapis.com/ws/"
     f"google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent"
