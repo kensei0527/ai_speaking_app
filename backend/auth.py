@@ -81,6 +81,54 @@ def verify_token(credentials: HTTPAuthorizationCredentials = Depends(security)) 
         )
 
 
+def verify_token_raw(token: str, db: Session) -> Optional[models.User]:
+    """
+    WebSocket 用: 生トークン文字列を受け取り、対応する User を返す。
+    失敗時は None を返す（HTTPException は raise しない）。
+    """
+    try:
+        header = jwt.get_unverified_header(token)
+        alg = header.get("alg", "")
+
+        if alg in ("RS256", "ES256"):
+            kid = header.get("kid")
+            jwks = _get_jwks()
+            key_data = next((k for k in jwks.get("keys", []) if k.get("kid") == kid), None)
+            if not key_data:
+                global _jwks_cache
+                _jwks_cache = None
+                jwks = _get_jwks()
+                key_data = next((k for k in jwks.get("keys", []) if k.get("kid") == kid), None)
+            if not key_data:
+                return None
+            payload = jwt.decode(token, key_data, algorithms=[alg], options={"verify_aud": False})
+        else:
+            payload = jwt.decode(
+                token, SUPABASE_JWT_SECRET, algorithms=["HS256"], options={"verify_aud": False}
+            )
+
+        user_id: str = payload.get("sub")
+        email: str = payload.get("email", "")
+        if not user_id:
+            return None
+
+        user = db.query(models.User).filter(models.User.id == user_id).first()
+        if not user:
+            user = models.User(
+                id=user_id,
+                email=email or f"user_{user_id}@example.com",
+                name=payload.get("user_metadata", {}).get("full_name") or "Guest",
+            )
+            db.add(user)
+            db.commit()
+            db.refresh(user)
+        return user
+
+    except Exception as e:
+        logging.error(f"verify_token_raw failed: {e}")
+        return None
+
+
 def get_current_user(
     payload: dict = Depends(verify_token),
     db: Session = Depends(get_db)

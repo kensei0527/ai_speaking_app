@@ -1052,5 +1052,154 @@ def get_skill_report(
     )
 
 
+# ─── Live Conversation (Add-on Feature) ──────────────────────────────────────
+
+from fastapi import WebSocket, WebSocketDisconnect
+import conversation_service
+
+
+@app.get("/api/chapters/{chapter_id}/phrases")
+def get_chapter_phrases(
+    chapter_id: int,
+    db: Session = Depends(database.get_db),
+    user: models.User = Depends(auth.get_current_user),
+):
+    """
+    ユーザーがその章で実際に学んだフレーズのリストを返す。
+    会話モードのシステムプロンプト構築に使用。
+    """
+    chapter = db.query(models.Chapter).filter(models.Chapter.id == chapter_id).first()
+    if not chapter:
+        raise HTTPException(status_code=404, detail="Chapter not found")
+
+    # その章のユーザー解答から正解したフレーズを取得（最大20件）
+    correct_attempts = (
+        db.query(models.Attempt)
+        .filter(
+            models.Attempt.user_id == user.id,
+            models.Attempt.chapter_id == chapter_id,
+            models.Attempt.is_correct == True,
+        )
+        .order_by(models.Attempt.created_at.desc())
+        .limit(30)
+        .all()
+    )
+
+    # question の expected_english_text を取得（重複除去）
+    seen = set()
+    phrases = []
+    for a in correct_attempts:
+        q = db.query(models.Question).filter(models.Question.id == a.question_id).first()
+        if q and q.expected_english_text and q.expected_english_text not in seen:
+            seen.add(q.expected_english_text)
+            phrases.append(q.expected_english_text)
+            if len(phrases) >= 20:
+                break
+
+    # 正解フレーズが少ない場合は全問題フレーズで補完
+    if len(phrases) < 5:
+        questions = (
+            db.query(models.Question)
+            .filter(models.Question.chapter_id == chapter_id)
+            .limit(20)
+            .all()
+        )
+        for q in questions:
+            if q.expected_english_text and q.expected_english_text not in seen:
+                seen.add(q.expected_english_text)
+                phrases.append(q.expected_english_text)
+
+    return {
+        "chapter_id": chapter_id,
+        "chapter_title": chapter.title,
+        "phrases": phrases[:20],
+    }
+
+
+@app.websocket("/ws/live-conversation/{chapter_id}")
+async def live_conversation(
+    websocket: WebSocket,
+    chapter_id: int,
+    db: Session = Depends(database.get_db),
+):
+    """
+    Gemini Live API へのリアルタイム音声会話プロキシ。
+    既存の問題生成・採点フローとは完全に独立した追加機能。
+
+    認証: 最初のメッセージで {"type": "auth", "token": "<supabase_access_token>"} を受け取り、
+          auth.py の verify_token で検証する。
+    """
+    await websocket.accept()
+
+    # ─ 認証フェーズ ─────────────────────────────────────────────────────────
+    try:
+        raw_auth = await asyncio.wait_for(websocket.receive_text(), timeout=10.0)
+        auth_msg = json.loads(raw_auth)
+        if auth_msg.get("type") != "auth":
+            await websocket.send_json({"type": "error", "message": "First message must be auth."})
+            await websocket.close()
+            return
+
+        token = auth_msg.get("token", "")
+        user = auth.verify_token_raw(token, db)
+        if not user:
+            await websocket.send_json({"type": "error", "message": "Unauthorized."})
+            await websocket.close()
+            return
+
+    except (asyncio.TimeoutError, Exception) as e:
+        await websocket.send_json({"type": "error", "message": f"Auth failed: {e}"})
+        await websocket.close()
+        return
+
+    # ─ フレーズ取得 ──────────────────────────────────────────────────────────
+    chapter = db.query(models.Chapter).filter(models.Chapter.id == chapter_id).first()
+    if not chapter:
+        await websocket.send_json({"type": "error", "message": "Chapter not found."})
+        await websocket.close()
+        return
+
+    correct_attempts = (
+        db.query(models.Attempt)
+        .filter(
+            models.Attempt.user_id == user.id,
+            models.Attempt.chapter_id == chapter_id,
+            models.Attempt.is_correct == True,
+        )
+        .order_by(models.Attempt.created_at.desc())
+        .limit(30)
+        .all()
+    )
+    seen: set[str] = set()
+    phrases: list[str] = []
+    for a in correct_attempts:
+        q = db.query(models.Question).filter(models.Question.id == a.question_id).first()
+        if q and q.expected_english_text and q.expected_english_text not in seen:
+            seen.add(q.expected_english_text)
+            phrases.append(q.expected_english_text)
+            if len(phrases) >= 20:
+                break
+
+    if len(phrases) < 5:
+        questions = (
+            db.query(models.Question)
+            .filter(models.Question.chapter_id == chapter_id)
+            .limit(20)
+            .all()
+        )
+        for q in questions:
+            if q.expected_english_text and q.expected_english_text not in seen:
+                seen.add(q.expected_english_text)
+                phrases.append(q.expected_english_text)
+
+    # ─ Gemini Live API へ中継 ────────────────────────────────────────────────
+    await conversation_service.proxy_live_session(
+        client_ws=websocket,
+        chapter_title=chapter.title,
+        phrases=phrases[:20],
+    )
+
+
 if __name__ == "__main__":
     uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
+

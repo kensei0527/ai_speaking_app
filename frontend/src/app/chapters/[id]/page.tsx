@@ -20,6 +20,7 @@ import {
   Zap,
 } from "lucide-react";
 import { createClient } from "@/utils/supabase/client";
+import LiveConversationModal from "@/components/LiveConversationModal";
 
 const API_URL = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
 
@@ -78,6 +79,7 @@ export default function ChapterDetailPage() {
   const chapterId = params.id as string;
   const [chapter, setChapter] = useState<ChapterDetail | null>(null);
   const [loading, setLoading] = useState(true);
+  const [showLiveConversation, setShowLiveConversation] = useState(false);
   const supabase = createClient();
 
   useEffect(() => {
@@ -383,8 +385,44 @@ export default function ChapterDetailPage() {
           </motion.div>
         )}
 
-        {/* ── Main Start Button Removed (Using Per-Scenario Buttons) ────────────────────────────── */}
+        {/* ── Live Conversation Button ─────────────────────────────────────── */}
+        {chapter.status !== "locked" && (
+          <motion.div
+            initial={{ opacity: 0, y: 20 }}
+            animate={{ opacity: 1, y: 0 }}
+            transition={{ delay: 0.4 }}
+            className="glass-panel rounded-2xl p-5 sm:p-6 mb-8"
+          >
+            <div className="flex flex-col sm:flex-row items-start sm:items-center justify-between gap-4">
+              <div>
+                <div className="flex items-center gap-2 mb-1">
+                  <Sparkles size={18} className="text-violet-500" />
+                  <h3 className="font-bold text-slate-700 dark:text-slate-200">音声会話で実践する</h3>
+                </div>
+                <p className="text-sm text-slate-500 dark:text-slate-400">
+                  この章で学んだフレーズを使って、AIと実際に英語で会話しよう。
+                </p>
+              </div>
+              <button
+                onClick={() => setShowLiveConversation(true)}
+                className="flex-shrink-0 flex items-center gap-2 px-5 py-2.5 text-white text-sm font-bold rounded-full shadow-md hover:shadow-lg transition-all hover:-translate-y-0.5"
+                style={{ background: "linear-gradient(135deg, #7c3aed, #4f46e5)" }}
+              >
+                <Zap size={16} />
+                音声で実践する
+              </button>
+            </div>
+          </motion.div>
+        )}
       </div>
+
+      {/* Live Conversation Modal (mounted outside the scroll container) */}
+      <LiveConversationModal
+        isOpen={showLiveConversation}
+        onClose={() => setShowLiveConversation(false)}
+        chapterId={chapter.id}
+        chapterTitle={chapter.title}
+      />
     </div>
   );
 }
