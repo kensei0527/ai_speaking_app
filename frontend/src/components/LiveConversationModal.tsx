@@ -1,14 +1,21 @@
 "use client";
 
 /**
- * LiveConversationModal.tsx
+ * LiveConversationModal.tsx  ─ Ephemeral Token 方式（セキュア版）
  * ────────────────────────────────────────────────────────────────────────────
- * 章末の「音声で実践する」ボタンから開くリアルタイム音声会話モーダル。
- * 既存の問題・採点フローには一切干渉しない独立したコンポーネント。
+ * 概要:
+ *   1. バックエンド POST /api/chapters/{id}/live-token
+ *      → 認証済みユーザーにのみ、60秒有効な ephemeral token を返す
+ *      → 実際の GEMINI_API_KEY はサーバー内に留まり、フロントには渡らない
+ *      → システムプロンプト・モデル設定もトークンに埋め込まれる
+ *
+ *   2. フロントはそのトークンを access_token として
+ *      wss://generativelanguage.googleapis.com/.../v1alpha/...?access_token=TOKEN
+ *      に直接 WebSocket 接続する
  *
  * 音声フロー:
- *   マイク → AudioWorklet(生PCM16kHz) → base64 → WebSocket → バックエンドプロキシ → Gemini Live API
- *   Gemini Live API → バックエンドプロキシ → WebSocket → base64 → PCM24kHz → AudioContext → スピーカー
+ *   マイク → ScriptProcessor(PCM 16kHz) → base64 → Gemini Live API
+ *   Gemini Live API → base64 PCM(24kHz) → AudioContext → スピーカー
  */
 
 import { useEffect, useRef, useState, useCallback } from "react";
@@ -26,7 +33,6 @@ import {
 } from "lucide-react";
 
 const API_URL = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
-const WS_URL = API_URL.replace(/^http/, "ws"); // http→ws, https→wss
 
 interface TranscriptEntry {
   role: "user" | "model";
@@ -43,30 +49,43 @@ interface Props {
 
 type ConnectionStatus =
   | "idle"
+  | "fetching-token"
   | "connecting"
   | "connected"
   | "error"
   | "stopped";
 
-// ─── PCM16 → Float32 変換ヘルパー ──────────────────────────────────────────
+// ─── PCM16 → Float32 ──────────────────────────────────────────────────────
 function pcm16ToFloat32(buffer: ArrayBuffer): Float32Array<ArrayBuffer> {
   const int16 = new Int16Array(buffer);
-  const float32 = new Float32Array(int16.length);
-  for (let i = 0; i < int16.length; i++) {
-    float32[i] = int16[i] / 32768;
-  }
-  return float32;
+  const out = new Float32Array(int16.length);
+  for (let i = 0; i < int16.length; i++) out[i] = int16[i] / 32768;
+  return out;
 }
 
-// ─── Float32 → PCM16 変換ヘルパー ──────────────────────────────────────────
-function float32ToPcm16(float32: Float32Array): ArrayBuffer {
-  const buf = new ArrayBuffer(float32.length * 2);
+// ─── Float32 → PCM16 ──────────────────────────────────────────────────────
+function float32ToPcm16(input: Float32Array): ArrayBuffer {
+  const buf = new ArrayBuffer(input.length * 2);
   const view = new DataView(buf);
-  for (let i = 0; i < float32.length; i++) {
-    const s = Math.max(-1, Math.min(1, float32[i]));
+  for (let i = 0; i < input.length; i++) {
+    const s = Math.max(-1, Math.min(1, input[i]));
     view.setInt16(i * 2, s < 0 ? s * 0x8000 : s * 0x7fff, true);
   }
   return buf;
+}
+
+function arrayBufferToBase64(buffer: ArrayBuffer): string {
+  const bytes = new Uint8Array(buffer);
+  let binary = "";
+  for (let i = 0; i < bytes.length; i++) binary += String.fromCharCode(bytes[i]);
+  return btoa(binary);
+}
+
+function base64ToArrayBuffer(base64: string): ArrayBuffer {
+  const binary = atob(base64);
+  const bytes = new Uint8Array(binary.length);
+  for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+  return bytes.buffer as ArrayBuffer;
 }
 
 export default function LiveConversationModal({
@@ -78,11 +97,12 @@ export default function LiveConversationModal({
   const wsRef = useRef<WebSocket | null>(null);
   const audioCtxRef = useRef<AudioContext | null>(null);
   const mediaStreamRef = useRef<MediaStream | null>(null);
-  const scriptProcessorRef = useRef<ScriptProcessorNode | null>(null);
+  const processorRef = useRef<ScriptProcessorNode | null>(null);
   const audioQueueRef = useRef<Float32Array<ArrayBuffer>[]>([]);
   const isPlayingRef = useRef(false);
   const transcriptEndRef = useRef<HTMLDivElement | null>(null);
   const entryIdRef = useRef(0);
+  const isMutedRef = useRef(false); // ScriptProcessor は closure を参照するので ref で管理
 
   const [status, setStatus] = useState<ConnectionStatus>("idle");
   const [isMuted, setIsMuted] = useState(false);
@@ -90,7 +110,7 @@ export default function LiveConversationModal({
   const [errorMsg, setErrorMsg] = useState("");
   const [isAISpeaking, setIsAISpeaking] = useState(false);
 
-  // ─── オーディオチャンクのキューから順番に再生 ─────────────────────────
+  // ─ キュー再生 ────────────────────────────────────────────────────────────
   const playNextChunk = useCallback(() => {
     if (!audioCtxRef.current || audioQueueRef.current.length === 0) {
       isPlayingRef.current = false;
@@ -100,51 +120,36 @@ export default function LiveConversationModal({
     isPlayingRef.current = true;
     setIsAISpeaking(true);
     const samples = audioQueueRef.current.shift()!;
-    const buffer = audioCtxRef.current.createBuffer(
-      1,
-      samples.length,
-      24000 // Gemini Live API output is 24kHz
-    );
-    buffer.copyToChannel(samples, 0);
-    const source = audioCtxRef.current.createBufferSource();
-    source.buffer = buffer;
-    source.connect(audioCtxRef.current.destination);
-    source.onended = playNextChunk;
-    source.start();
+    const buf = audioCtxRef.current.createBuffer(1, samples.length, 24000);
+    buf.copyToChannel(samples, 0);
+    const src = audioCtxRef.current.createBufferSource();
+    src.buffer = buf;
+    src.connect(audioCtxRef.current.destination);
+    src.onended = playNextChunk;
+    src.start();
   }, []);
 
-  // ─── base64 PCM → キューに追加して再生 ────────────────────────────────
-  const handleAudioChunk = useCallback(
+  const enqueueAudio = useCallback(
     (base64: string) => {
-      const binary = atob(base64);
-      const bytes = new Uint8Array(binary.length);
-      for (let i = 0; i < binary.length; i++) {
-        bytes[i] = binary.charCodeAt(i);
-      }
-      const float32 = pcm16ToFloat32(bytes.buffer as ArrayBuffer);
-      audioQueueRef.current.push(float32);
-      if (!isPlayingRef.current) {
-        playNextChunk();
-      }
+      const f32 = pcm16ToFloat32(base64ToArrayBuffer(base64));
+      audioQueueRef.current.push(f32);
+      if (!isPlayingRef.current) playNextChunk();
     },
     [playNextChunk]
   );
 
-  // ─── クリーンアップ ─────────────────────────────────────────────────────
+  // ─ クリーンアップ ────────────────────────────────────────────────────────
   const cleanup = useCallback(() => {
-    if (scriptProcessorRef.current) {
-      scriptProcessorRef.current.disconnect();
-      scriptProcessorRef.current = null;
-    }
-    if (mediaStreamRef.current) {
-      mediaStreamRef.current.getTracks().forEach((t) => t.stop());
-      mediaStreamRef.current = null;
-    }
-    if (audioCtxRef.current) {
-      audioCtxRef.current.close().catch(() => {});
-      audioCtxRef.current = null;
-    }
+    processorRef.current?.disconnect();
+    processorRef.current = null;
+    mediaStreamRef.current?.getTracks().forEach((t) => t.stop());
+    mediaStreamRef.current = null;
+    audioCtxRef.current?.close().catch(() => {});
+    audioCtxRef.current = null;
     if (wsRef.current) {
+      wsRef.current.onmessage = null;
+      wsRef.current.onclose = null;
+      wsRef.current.onerror = null;
       wsRef.current.close();
       wsRef.current = null;
     }
@@ -153,93 +158,116 @@ export default function LiveConversationModal({
     setIsAISpeaking(false);
   }, []);
 
-  // ─── セッション開始 ─────────────────────────────────────────────────────
+  // ─ セッション開始（Ephemeral Token フロー）───────────────────────────────
   const startSession = useCallback(async () => {
-    setStatus("connecting");
+    setStatus("fetching-token");
     setTranscript([]);
     setErrorMsg("");
 
     try {
-      // 1. Supabase トークン取得
+      // 1. Supabase アクセストークン取得
       const supabase = createClient();
-      const {
-        data: { session },
-      } = await supabase.auth.getSession();
-      if (!session) {
-        throw new Error("ログインが必要です。");
-      }
+      const { data: { session } } = await supabase.auth.getSession();
+      if (!session) throw new Error("ログインが必要です。");
 
-      // 2. マイク起動
+      // 2. バックエンドに ephemeral token を要求（実APIキーはここで使われ、フロントには出ない）
+      const tokenRes = await fetch(
+        `${API_URL}/api/chapters/${chapterId}/live-token`,
+        {
+          method: "POST",
+          headers: {
+            Authorization: `Bearer ${session.access_token}`,
+            "Content-Type": "application/json",
+          },
+        }
+      );
+      if (!tokenRes.ok) {
+        const err = await tokenRes.json().catch(() => ({}));
+        throw new Error(err.detail || `トークン取得失敗 (${tokenRes.status})`);
+      }
+      const { ws_url } = await tokenRes.json();
+
+      // 3. マイク起動
+      setStatus("connecting");
       const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
       mediaStreamRef.current = stream;
 
-      // 3. AudioContext (マイク入力: 16kHz リサンプリング用)
+      // 4. AudioContext (16kHz でマイク入力をリサンプル)
       const audioCtx = new AudioContext({ sampleRate: 16000 });
       audioCtxRef.current = audioCtx;
-      const source = audioCtx.createMediaStreamSource(stream);
-
-      // ScriptProcessor でマイクの生 PCM を取得し WebSocket に流す
+      const micSource = audioCtx.createMediaStreamSource(stream);
       const processor = audioCtx.createScriptProcessor(4096, 1, 1);
-      scriptProcessorRef.current = processor;
+      processorRef.current = processor;
 
       processor.onaudioprocess = (e) => {
         if (!wsRef.current || wsRef.current.readyState !== WebSocket.OPEN) return;
-        if (isMuted) return;
-        const float32 = e.inputBuffer.getChannelData(0);
-        const pcm16 = float32ToPcm16(float32);
-        const b64 = btoa(
-          String.fromCharCode(...new Uint8Array(pcm16))
-        );
+        if (isMutedRef.current) return;
+        const b64 = arrayBufferToBase64(float32ToPcm16(e.inputBuffer.getChannelData(0)));
         wsRef.current.send(
-          JSON.stringify({ type: "audio", data: b64 })
+          JSON.stringify({
+            realtimeInput: { audio: { data: b64, mimeType: "audio/pcm;rate=16000" } },
+          })
         );
       };
-      source.connect(processor);
+      micSource.connect(processor);
       processor.connect(audioCtx.destination);
 
-      // 4. WebSocket 接続
-      const wsEndpoint = `${WS_URL}/ws/live-conversation/${chapterId}`;
-      const ws = new WebSocket(wsEndpoint);
+      // 5. Gemini Live API v1alpha に ephemeral token で接続
+      //    ※ liveConnectConstraints でモデル・設定が埋め込み済みなので setup 送信不要
+      const ws = new WebSocket(ws_url);
       wsRef.current = ws;
 
       ws.onopen = () => {
-        // 認証メッセージを最初に送る
-        ws.send(
-          JSON.stringify({ type: "auth", token: session.access_token })
-        );
+        // v1alpha + Constrained エンドポイントはトークンに設定を持つのでsetupは不要。
+        // ただし setupComplete を待ってから connected にする。
+        // → サーバーが setupComplete を送ってくる
       };
 
       ws.onmessage = (event) => {
-        const msg = JSON.parse(event.data);
+        const msg = JSON.parse(event.data as string);
 
-        if (msg.type === "connected") {
+        if (msg.setupComplete) {
           setStatus("connected");
-        } else if (msg.type === "audio") {
-          handleAudioChunk(msg.data);
-        } else if (msg.type === "transcript") {
-          setTranscript((prev) => [
-            ...prev,
-            {
-              role: msg.role,
-              text: msg.text,
-              id: entryIdRef.current++,
-            },
+          return;
+        }
+
+        const sc = msg.serverContent;
+        if (!sc) return;
+
+        // 音声チャンク
+        for (const part of sc.modelTurn?.parts ?? []) {
+          if (part.inlineData?.data) enqueueAudio(part.inlineData.data);
+        }
+
+        // テキスト転写
+        if (sc.inputTranscription?.text) {
+          setTranscript((p) => [
+            ...p,
+            { role: "user", text: sc.inputTranscription.text, id: entryIdRef.current++ },
           ]);
-        } else if (msg.type === "error") {
-          setErrorMsg(msg.message || "エラーが発生しました。");
-          setStatus("error");
-        } else if (msg.type === "stopped") {
-          setStatus("stopped");
+        }
+        if (sc.outputTranscription?.text) {
+          setTranscript((p) => [
+            ...p,
+            { role: "model", text: sc.outputTranscription.text, id: entryIdRef.current++ },
+          ]);
         }
       };
 
       ws.onerror = () => {
-        setErrorMsg("接続に失敗しました。バックエンドが起動しているか確認してください。");
+        setErrorMsg("Gemini Live APIへの接続でエラーが発生しました。");
         setStatus("error");
+        cleanup();
       };
 
-      ws.onclose = () => {
-        if (status !== "error") setStatus("stopped");
+      ws.onclose = (e) => {
+        if (e.code !== 1000) {
+          setErrorMsg(`接続が切断されました (code: ${e.code})`);
+          setStatus("error");
+        } else {
+          setStatus("stopped");
+        }
+        cleanup();
       };
     } catch (err: unknown) {
       const message = err instanceof Error ? err.message : String(err);
@@ -247,52 +275,63 @@ export default function LiveConversationModal({
       setStatus("error");
       cleanup();
     }
-  }, [chapterId, isMuted, handleAudioChunk, cleanup, status]);
+  }, [chapterId, enqueueAudio, cleanup]);
 
-  // ─── セッション終了 ─────────────────────────────────────────────────────
+  // ─ セッション終了 ────────────────────────────────────────────────────────
   const endSession = useCallback(() => {
-    if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
-      wsRef.current.send(JSON.stringify({ type: "end" }));
+    if (wsRef.current?.readyState === WebSocket.OPEN) {
+      wsRef.current.close(1000, "User ended session");
+    } else {
+      cleanup();
     }
-    cleanup();
     setStatus("stopped");
   }, [cleanup]);
 
-  // ─── モーダルを閉じる ───────────────────────────────────────────────────
   const handleClose = useCallback(() => {
     endSession();
     onClose();
   }, [endSession, onClose]);
 
-  // ─── ミュート切り替え ────────────────────────────────────────────────────
+  // ─ ミュート ─────────────────────────────────────────────────────────────
   const toggleMute = useCallback(() => {
     setIsMuted((prev) => {
       const next = !prev;
-      if (mediaStreamRef.current) {
-        mediaStreamRef.current
-          .getAudioTracks()
-          .forEach((t) => (t.enabled = !next));
-      }
+      isMutedRef.current = next;
+      mediaStreamRef.current?.getAudioTracks().forEach((t) => (t.enabled = !next));
       return next;
     });
   }, []);
 
-  // ─── トランスクリプト自動スクロール ─────────────────────────────────────
+  // ─ 副作用 ────────────────────────────────────────────────────────────────
   useEffect(() => {
     transcriptEndRef.current?.scrollIntoView({ behavior: "smooth" });
   }, [transcript]);
 
-  // ─── モーダルを閉じたときにクリーンアップ ───────────────────────────────
   useEffect(() => {
     if (!isOpen) {
       cleanup();
       setStatus("idle");
       setTranscript([]);
       setErrorMsg("");
+      setIsMuted(false);
+      isMutedRef.current = false;
     }
   }, [isOpen, cleanup]);
 
   if (!isOpen) return null;
+
+  const statusLabel = {
+    idle: null,
+    "fetching-token": "接続の準備中...",
+    connecting: "Geminiに接続中...",
+    connected: isMuted ? "ミュート中" : "話しかけてください...",
+    error: null,
+    stopped: "会話が終了しました",
+  }[status];
+
+  const isActive = status === "connected";
+  const isBusy = status === "fetching-token" || status === "connecting";
+  const canStart = status === "idle" || status === "stopped" || status === "error";
 
   return (
     <AnimatePresence>
@@ -302,7 +341,7 @@ export default function LiveConversationModal({
           animate={{ opacity: 1 }}
           exit={{ opacity: 0 }}
           className="fixed inset-0 z-50 flex items-center justify-center p-4"
-          style={{ backgroundColor: "rgba(0,0,0,0.7)", backdropFilter: "blur(8px)" }}
+          style={{ backgroundColor: "rgba(0,0,0,0.75)", backdropFilter: "blur(8px)" }}
           onClick={(e) => e.target === e.currentTarget && handleClose()}
         >
           <motion.div
@@ -316,15 +355,11 @@ export default function LiveConversationModal({
               boxShadow: "0 25px 60px rgba(99,102,241,0.4)",
             }}
           >
-            {/* Animated background orbs */}
-            <div
-              className="absolute -top-12 -right-12 w-40 h-40 rounded-full opacity-20 blur-3xl"
-              style={{ background: "radial-gradient(circle, #a78bfa, transparent)" }}
-            />
-            <div
-              className="absolute -bottom-12 -left-12 w-40 h-40 rounded-full opacity-20 blur-3xl"
-              style={{ background: "radial-gradient(circle, #818cf8, transparent)" }}
-            />
+            {/* Decorative orbs */}
+            <div className="absolute -top-12 -right-12 w-40 h-40 rounded-full opacity-20 blur-3xl"
+              style={{ background: "radial-gradient(circle, #a78bfa, transparent)" }} />
+            <div className="absolute -bottom-12 -left-12 w-40 h-40 rounded-full opacity-20 blur-3xl"
+              style={{ background: "radial-gradient(circle, #818cf8, transparent)" }} />
 
             {/* Header */}
             <div className="relative px-6 pt-6 pb-4 border-b border-white/10">
@@ -350,67 +385,78 @@ export default function LiveConversationModal({
 
             {/* Body */}
             <div className="relative px-6 py-5 flex flex-col gap-4">
-              {/* ─ AI Speaking Visualizer ─ */}
-              <div className="flex items-center justify-center h-20">
-                {status === "connected" && isAISpeaking ? (
+
+              {/* Visualizer area */}
+              <div className="flex items-center justify-center h-24">
+                {isActive && isAISpeaking ? (
                   <div className="flex items-end gap-1 h-full">
-                    {[...Array(12)].map((_, i) => (
+                    {[...Array(14)].map((_, i) => (
                       <motion.div
                         key={i}
                         className="w-1.5 rounded-full"
                         style={{ background: "linear-gradient(to top, #818cf8, #c4b5fd)" }}
-                        animate={{ height: ["8px", `${20 + Math.random() * 30}px`, "8px"] }}
+                        animate={{ height: ["6px", `${18 + Math.random() * 32}px`, "6px"] }}
                         transition={{
-                          duration: 0.5 + Math.random() * 0.5,
+                          duration: 0.4 + Math.random() * 0.5,
                           repeat: Infinity,
-                          delay: i * 0.05,
+                          delay: i * 0.04,
+                          ease: "easeInOut",
                         }}
                       />
                     ))}
                   </div>
-                ) : status === "connected" && !isAISpeaking ? (
+                ) : isActive ? (
                   <div className="flex flex-col items-center gap-2">
-                    <div className="flex items-center gap-2">
-                      <Waves className="w-5 h-5 text-indigo-400 animate-pulse" />
-                      <span className="text-indigo-300 text-sm">
-                        {isMuted ? "ミュート中..." : "聴いています..."}
-                      </span>
-                    </div>
+                    <motion.div
+                      className="w-14 h-14 rounded-full flex items-center justify-center"
+                      style={{ background: "rgba(99,102,241,0.2)", border: "2px solid rgba(99,102,241,0.4)" }}
+                      animate={{ scale: [1, 1.08, 1], opacity: [0.8, 1, 0.8] }}
+                      transition={{ duration: 2, repeat: Infinity }}
+                    >
+                      {isMuted ? (
+                        <MicOff className="w-6 h-6 text-red-400" />
+                      ) : (
+                        <Mic className="w-6 h-6 text-indigo-300" />
+                      )}
+                    </motion.div>
+                    <span className="text-indigo-300 text-sm">{statusLabel}</span>
                   </div>
-                ) : status === "connecting" ? (
+                ) : isBusy ? (
                   <div className="flex flex-col items-center gap-2">
                     <Loader2 className="w-8 h-8 text-indigo-400 animate-spin" />
-                    <span className="text-indigo-300 text-sm">接続中...</span>
+                    <span className="text-indigo-300 text-sm">{statusLabel}</span>
                   </div>
                 ) : status === "error" ? (
                   <div className="flex flex-col items-center gap-2 text-center">
                     <AlertCircle className="w-8 h-8 text-red-400" />
-                    <span className="text-red-300 text-sm max-w-xs">{errorMsg}</span>
+                    <span className="text-red-300 text-sm max-w-xs leading-snug">{errorMsg}</span>
                   </div>
                 ) : status === "stopped" ? (
                   <div className="flex flex-col items-center gap-2">
-                    <span className="text-slate-400 text-sm">会話が終了しました</span>
+                    <div className="w-12 h-12 rounded-full bg-white/5 flex items-center justify-center">
+                      <PhoneOff className="w-5 h-5 text-slate-400" />
+                    </div>
+                    <span className="text-slate-400 text-sm">{statusLabel}</span>
                   </div>
                 ) : (
+                  // idle
                   <div className="flex flex-col items-center gap-3">
                     <div
                       className="w-16 h-16 rounded-full flex items-center justify-center border-2 border-indigo-400/40"
-                      style={{ background: "rgba(99,102,241,0.15)" }}
+                      style={{ background: "rgba(99,102,241,0.12)" }}
                     >
                       <Mic className="w-8 h-8 text-indigo-400" />
                     </div>
-                    <span className="text-indigo-300/70 text-sm">
-                      「会話を始める」で英会話をスタート
-                    </span>
+                    <span className="text-indigo-300/60 text-sm">「会話を始める」で英会話をスタート</span>
                   </div>
                 )}
               </div>
 
-              {/* ─ Transcript ─ */}
+              {/* Transcript */}
               {transcript.length > 0 && (
                 <div
                   className="max-h-48 overflow-y-auto space-y-2 rounded-2xl p-3"
-                  style={{ background: "rgba(0,0,0,0.25)" }}
+                  style={{ background: "rgba(0,0,0,0.28)" }}
                 >
                   <div className="flex items-center gap-1.5 mb-2">
                     <MessageSquare className="w-3.5 h-3.5 text-indigo-400" />
@@ -422,16 +468,12 @@ export default function LiveConversationModal({
                       className={`flex ${entry.role === "user" ? "justify-end" : "justify-start"}`}
                     >
                       <div
-                        className={`max-w-[85%] px-3 py-2 rounded-2xl text-sm ${
-                          entry.role === "user"
-                            ? "rounded-br-sm text-white"
-                            : "rounded-bl-sm text-indigo-100"
+                        className={`max-w-[85%] px-3 py-2 rounded-2xl text-sm leading-relaxed ${
+                          entry.role === "user" ? "rounded-br-sm text-white" : "rounded-bl-sm text-indigo-100"
                         }`}
                         style={{
                           background:
-                            entry.role === "user"
-                              ? "rgba(99,102,241,0.5)"
-                              : "rgba(255,255,255,0.08)",
+                            entry.role === "user" ? "rgba(99,102,241,0.5)" : "rgba(255,255,255,0.08)",
                         }}
                       >
                         {entry.text}
@@ -442,9 +484,9 @@ export default function LiveConversationModal({
                 </div>
               )}
 
-              {/* ─ Controls ─ */}
+              {/* Controls */}
               <div className="flex items-center justify-center gap-4">
-                {status === "idle" || status === "stopped" || status === "error" ? (
+                {canStart ? (
                   <motion.button
                     whileHover={{ scale: 1.05 }}
                     whileTap={{ scale: 0.95 }}
@@ -452,42 +494,36 @@ export default function LiveConversationModal({
                     className="flex items-center gap-2 px-8 py-3 rounded-full font-bold text-white shadow-lg"
                     style={{
                       background: "linear-gradient(135deg, #6366f1, #8b5cf6)",
-                      boxShadow: "0 0 20px rgba(99,102,241,0.4)",
+                      boxShadow: "0 0 24px rgba(99,102,241,0.4)",
                     }}
                   >
                     <Mic className="w-5 h-5" />
                     {status === "error" ? "再接続する" : "会話を始める"}
                   </motion.button>
-                ) : status === "connecting" ? (
+                ) : isBusy ? (
                   <button
                     disabled
                     className="flex items-center gap-2 px-8 py-3 rounded-full font-bold text-white/50 bg-white/10 cursor-not-allowed"
                   >
                     <Loader2 className="w-5 h-5 animate-spin" />
-                    接続中...
+                    準備中...
                   </button>
                 ) : (
                   <>
-                    {/* Mute Button */}
                     <motion.button
                       whileHover={{ scale: 1.1 }}
                       whileTap={{ scale: 0.9 }}
                       onClick={toggleMute}
+                      title={isMuted ? "ミュート解除" : "ミュート"}
                       className={`w-12 h-12 rounded-full flex items-center justify-center border transition-all ${
                         isMuted
                           ? "bg-red-500/20 border-red-500/50 text-red-400"
                           : "bg-white/10 border-white/20 text-white hover:bg-white/20"
                       }`}
-                      title={isMuted ? "ミュート解除" : "ミュート"}
                     >
-                      {isMuted ? (
-                        <MicOff className="w-5 h-5" />
-                      ) : (
-                        <Mic className="w-5 h-5" />
-                      )}
+                      {isMuted ? <MicOff className="w-5 h-5" /> : <Mic className="w-5 h-5" />}
                     </motion.button>
 
-                    {/* End Call Button */}
                     <motion.button
                       whileHover={{ scale: 1.05 }}
                       whileTap={{ scale: 0.95 }}
@@ -502,10 +538,14 @@ export default function LiveConversationModal({
                 )}
               </div>
 
-              {/* ─ Disclaimer ─ */}
-              <p className="text-center text-indigo-400/40 text-xs">
-                AIとの英語会話練習 • この章で学んだフレーズを使って話してみよう
-              </p>
+              {/* Security badge */}
+              <div className="flex items-center justify-center gap-1.5">
+                <div className="w-1.5 h-1.5 rounded-full bg-green-400 animate-pulse" />
+                <p className="text-center text-indigo-400/50 text-xs">
+                  セキュア接続 • この章で学んだフレーズを使って話してみよう
+                </p>
+              </div>
+
             </div>
           </motion.div>
         </motion.div>

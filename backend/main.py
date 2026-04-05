@@ -9,6 +9,8 @@ import datetime
 import json
 import uvicorn
 import os
+import httpx
+
 
 import models, schemas, database, ai_service, auth
 
@@ -1198,6 +1200,114 @@ async def live_conversation(
         chapter_title=chapter.title,
         phrases=phrases[:20],
     )
+
+
+@app.post("/api/chapters/{chapter_id}/live-token")
+async def issue_live_token(
+    chapter_id: int,
+    db: Session = Depends(database.get_db),
+    user: models.User = Depends(auth.get_current_user),
+):
+    """
+    Gemini Live API 用の Ephemeral Token を発行して返す。
+
+    ・実際の GEMINI_API_KEY はこのサーバー内にとどまる（フロントに渡さない）
+    ・トークンには live_connect_constraints でモデル設定とシステムプロンプトを埋め込む
+    ・new_session_expire_time=1分 / expire_time=30分 で発行
+    ・フロントはこのトークンを access_token として v1alpha WSS エンドポイントに使う
+    """
+    # ─ 章とフレーズ取得 ──────────────────────────────────────────────────────
+    chapter = db.query(models.Chapter).filter(models.Chapter.id == chapter_id).first()
+    if not chapter:
+        raise HTTPException(status_code=404, detail="Chapter not found")
+
+    correct_attempts = (
+        db.query(models.Attempt)
+        .filter(
+            models.Attempt.user_id == user.id,
+            models.Attempt.chapter_id == chapter_id,
+            models.Attempt.is_correct == True,
+        )
+        .order_by(models.Attempt.created_at.desc())
+        .limit(30)
+        .all()
+    )
+    seen: set[str] = set()
+    phrases: list[str] = []
+    for a in correct_attempts:
+        q = db.query(models.Question).filter(models.Question.id == a.question_id).first()
+        if q and q.expected_english_text and q.expected_english_text not in seen:
+            seen.add(q.expected_english_text)
+            phrases.append(q.expected_english_text)
+            if len(phrases) >= 20:
+                break
+    if len(phrases) < 5:
+        questions = (
+            db.query(models.Question)
+            .filter(models.Question.chapter_id == chapter_id)
+            .limit(20)
+            .all()
+        )
+        for q in questions:
+            if q.expected_english_text and q.expected_english_text not in seen:
+                seen.add(q.expected_english_text)
+                phrases.append(q.expected_english_text)
+
+    system_prompt = conversation_service.build_system_prompt(chapter.title, phrases[:20])
+
+    # ─ Gemini API v1alpha で ephemeral token 発行 ────────────────────────────
+    now = datetime.datetime.now(tz=datetime.timezone.utc)
+
+    token_request_body = {
+        "uses": 1,
+        "expireTime": (now + datetime.timedelta(minutes=30)).isoformat(),
+        "newSessionExpireTime": (now + datetime.timedelta(minutes=2)).isoformat(),
+        "liveConnectConstraints": {
+            "model": f"models/{conversation_service.LIVE_API_MODEL}",
+            "config": {
+                "responseModalities": ["AUDIO"],
+                "speechConfig": {
+                    "voiceConfig": {
+                        "prebuiltVoiceConfig": {"voiceName": "Aoede"}
+                    }
+                },
+                "systemInstruction": {
+                    "parts": [{"text": system_prompt}]
+                },
+            },
+        },
+    }
+
+    try:
+        gemini_api_key = os.getenv("GEMINI_API_KEY", "")
+        response = httpx.post(
+            f"https://generativelanguage.googleapis.com/v1alpha/authTokens?key={gemini_api_key}",
+            json=token_request_body,
+            timeout=10.0,
+        )
+        response.raise_for_status()
+        token_data = response.json()
+        # token_data["name"] がトークン文字列
+        ephemeral_token = token_data.get("name", "")
+        if not ephemeral_token:
+            raise HTTPException(status_code=502, detail="Failed to extract token from Gemini response")
+    except httpx.HTTPStatusError as e:
+        raise HTTPException(
+            status_code=502,
+            detail=f"Gemini API error: {e.response.status_code} {e.response.text}",
+        )
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"Token issuance failed: {str(e)}")
+
+    return {
+        "token": ephemeral_token,
+        "expires_in_seconds": 120,  # new_session_expire_time に合わせた目安
+        "ws_url": (
+            "wss://generativelanguage.googleapis.com/ws/"
+            "google.ai.generativelanguage.v1alpha.GenerativeService.BidiGenerateContentConstrained"
+            f"?access_token={ephemeral_token}"
+        ),
+    }
 
 
 if __name__ == "__main__":
