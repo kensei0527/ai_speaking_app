@@ -405,34 +405,9 @@ def get_chapter_detail(
     )
 
 
-# ─── Diagnostic Endpoints ───────────────────────────────────────────────────
-
-@app.get("/api/debug/db-stats")
-def get_db_stats(db: Session = Depends(database.get_db)):
-    """Diagnostic endpoint to check if data exists in the production DB."""
-    scenario_count = db.query(models.Scenario).count()
-    question_count = db.query(models.Question).count()
-    
-    # Check if any questions have scenario_id assigned
-    questions_with_scenario = db.query(models.Question).filter(models.Question.scenario_id != None).count()
-    
-    # Sample some scenario IDs with their question counts
-    sample_scenarios = db.query(models.Scenario).limit(10).all()
-    scenario_list = []
-    for s in sample_scenarios:
-        count = db.query(models.Question).filter(models.Question.scenario_id == s.id).count()
-        scenario_list.append({"id": s.id, "title": s.title, "question_count": count})
-    
-    return {
-        "status": "ok",
-        "scenario_count": scenario_count,
-        "question_count": question_count,
-        "questions_with_scenario_id": questions_with_scenario,
-        "scenarios_diagnostics": scenario_list
-    }
-
 
 # ─── Lesson Endpoints ─────────────────────────────────────────────────────────
+
 
 @app.post("/api/lessons/start", response_model=schemas.LessonResponse)
 def start_lesson(
