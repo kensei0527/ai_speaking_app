@@ -405,6 +405,30 @@ def get_chapter_detail(
     )
 
 
+# ─── Diagnostic Endpoints ───────────────────────────────────────────────────
+
+@app.get("/api/debug/db-stats")
+def get_db_stats(db: Session = Depends(database.get_db)):
+    """Diagnostic endpoint to check if data exists in the production DB."""
+    scenario_count = db.query(models.Scenario).count()
+    question_count = db.query(models.Question).count()
+    
+    # Check if any questions have scenario_id assigned
+    questions_with_scenario = db.query(models.Question).filter(models.Question.scenario_id != None).count()
+    
+    # Sample some scenario IDs
+    sample_scenarios = db.query(models.Scenario).limit(5).all()
+    scenario_list = [{"id": s.id, "title": s.title} for s in sample_scenarios]
+    
+    return {
+        "status": "ok",
+        "scenario_count": scenario_count,
+        "question_count": question_count,
+        "questions_with_scenario_id": questions_with_scenario,
+        "sample_scenarios": scenario_list
+    }
+
+
 # ─── Lesson Endpoints ─────────────────────────────────────────────────────────
 
 @app.post("/api/lessons/start", response_model=schemas.LessonResponse)
@@ -421,7 +445,10 @@ def start_lesson(
 
     scenario = db.query(models.Scenario).filter(models.Scenario.id == req.scenario_id).first()
     if not scenario:
-        raise HTTPException(status_code=404, detail="Scenario not found")
+        raise HTTPException(
+            status_code=404, 
+            detail=f"Scenario not found for ID: {req.scenario_id}"
+        )
         
     chapter_id = scenario.chapter_id
 
@@ -445,7 +472,10 @@ def start_lesson(
     # Get predefined questions from DB (shuffle them)
     questions_query = db.query(models.Question).filter(models.Question.scenario_id == scenario.id).all()
     if not questions_query:
-        raise HTTPException(status_code=404, detail="No questions found for this scenario.")
+        raise HTTPException(
+            status_code=404, 
+            detail=f"No questions found for scenario ID: {scenario.id} (Title: {scenario.title})"
+        )
         
     import random
     random.shuffle(questions_query)
