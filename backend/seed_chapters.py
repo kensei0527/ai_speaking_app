@@ -154,7 +154,7 @@ CHAPTERS = [
 
 
 def generate_questions_for_scenario(chapter_title, grammar_points, cefr_level, scenario_title, scenario_desc, count=10):
-    """Generate diverse questions for a specific scenario using Gemini API."""
+    """Generate diverse questions for a specific scenario using Gemini API with retries."""
     if not api_key:
         print("No API Key. Returning fallback data for scenario.")
         return [
@@ -195,23 +195,41 @@ Output ONLY a JSON array of {count} objects. Each object must have:
 "difficulty": <integer 1-5>
 """
 
-    try:
-        response = model.generate_content(prompt)
-        text = response.text.strip()
-        data_list = json.loads(text)
-        return data_list[:count]
-    except Exception as e:
-        print(f"Error generating for scenario '{scenario_title}': {e}")
-        return []
+    max_retries = 3
+    for attempt in range(max_retries):
+        try:
+            response = model.generate_content(prompt)
+            text = response.text.strip()
+            # Basic cleanup in case of markdown blocks
+            if text.startswith("```json"):
+                text = text[7:]
+            if text.endswith("```"):
+                text = text[:-3]
+            text = text.strip()
+            
+            data_list = json.loads(text)
+            if data_list and isinstance(data_list, list) and len(data_list) > 0:
+                print(f"    [Success] Generated {len(data_list)} questions for '{scenario_title}'", flush=True)
+                return data_list[:count]
+            else:
+                print(f"    [Attempt {attempt+1}] Empty or invalid data returned for '{scenario_title}'", flush=True)
+        except Exception as e:
+            print(f"    [Attempt {attempt+1}] Error generating for '{scenario_title}': {e}", flush=True)
+            if attempt < max_retries - 1:
+                time.sleep(3) # Wait before retry
+    
+    print(f"❌ CRITICAL: Failed to generate questions for '{scenario_title}' after {max_retries} attempts.", flush=True)
+    return []
 
 
 def seed():
+    print("Starting seeding process...", flush=True)
     db = SessionLocal()
     try:
+        # Check and clear existing data
         existing_ch = db.query(models.Chapter).count()
         if existing_ch > 0:
-            print("Database already has chapters. We will clear everything to re-seed.")
-            # Clear data
+            print("Database already has chapters. Clearing everything to re-seed...", flush=True)
             db.query(models.Attempt).delete()
             db.query(models.LessonQuestion).delete()
             db.query(models.Lesson).delete()
@@ -221,11 +239,12 @@ def seed():
             db.query(models.UserChapterProgress).delete()
             db.query(models.Chapter).delete()
             db.commit()
+            print("Successfully cleared all existing data.", flush=True)
 
-        print("Seeding chapters, scenarios, and generating questions...")
+        print("\nSeeding chapters, scenarios, and generating questions...", flush=True)
 
         for ch_data in CHAPTERS:
-            print(f"Processing Chapter {ch_data['number']}: {ch_data['title']}")
+            print(f"\nProcessing Chapter {ch_data['number']}: {ch_data['title']}", flush=True)
             chapter = models.Chapter(
                 number=ch_data["number"],
                 title=ch_data["title"],
@@ -248,9 +267,10 @@ def seed():
                 db.add(scenario)
                 db.flush() # get scenario.id
 
-                print(f"  -> Generating questions for scenario: {scenario.title}")
-                # Generate 10 questions per scenario
-                questions = generate_questions_for_scenario(
+                print(f"  -> Scenario: {scenario.title}", flush=True)
+                
+                # Generate questions per scenario
+                questions_data = generate_questions_for_scenario(
                     chapter_title=chapter.title,
                     grammar_points=chapter.grammar_points,
                     cefr_level=chapter.cefr_level,
@@ -259,7 +279,11 @@ def seed():
                     count=10
                 )
 
-                for q_data in questions:
+                if not questions_data:
+                    print(f"    ⚠️ CRITICAL: Scenario '{scenario.title}' will have 0 questions!", flush=True)
+                    continue
+
+                for q_data in questions_data:
                     q = models.Question(
                         japanese_text=q_data.get("japanese_text", ""),
                         expected_english_text=q_data.get("expected_english_text", ""),
@@ -270,14 +294,17 @@ def seed():
                     )
                     db.add(q)
                 
-                # Small pause to avoid hitting rate limits too quickly
-                time.sleep(2)
+                # COMMIT PER SCENARIO to ensure progress is saved
+                db.commit()
+                print(f"    ✅ Successfully committed '{scenario.title}' with {len(questions_data)} questions.", flush=True)
+                
+                # Minimum sleep between scenarios
+                time.sleep(1)
 
-        db.commit()
-        print("✅ Successfully seeded all data.")
+        print("\n🎉 Seeding process completed successfully!", flush=True)
     except Exception as e:
         db.rollback()
-        print(f"❌ Error seeding data: {e}")
+        print(f"❌ Error during seeding: {e}", flush=True)
     finally:
         db.close()
 
