@@ -185,7 +185,17 @@ export default function LiveConversationModal({
         const err = await tokenRes.json().catch(() => ({}));
         throw new Error(err.detail || `トークン取得失敗 (${tokenRes.status})`);
       }
-      const { ws_url } = await tokenRes.json();
+      const { ws_url, chapter_title: fetchedTitle, phrases, model } = await tokenRes.json();
+
+      // システムプロンプトをフロントで組み立て (APIキーはバックエンドに留まるので安全)
+      const phraseList = (phrases as string[]).map((p: string) => `  - ${p}`).join("\n") || "  (none)";
+      const systemPrompt = `You are a friendly and encouraging English conversation coach.
+The student just completed Chapter: "${fetchedTitle}".
+They practiced these phrases:
+${phraseList}
+Have a natural, casual spoken conversation. Weave in these phrases naturally.
+Keep responses SHORT (1-3 sentences). Speak at a clear pace for learners.
+Start with a warm greeting.`;
 
       // 3. マイク起動
       setStatus("connecting");
@@ -213,14 +223,25 @@ export default function LiveConversationModal({
       processor.connect(audioCtx.destination);
 
       // 5. Gemini Live API v1alpha に ephemeral token で接続
-      //    ※ liveConnectConstraints でモデル・設定が埋め込み済みなので setup 送信不要
       const ws = new WebSocket(ws_url);
       wsRef.current = ws;
 
       ws.onopen = () => {
-        // v1alpha + Constrained エンドポイントはトークンに設定を持つのでsetupは不要。
-        // ただし setupComplete を待ってから connected にする。
-        // → サーバーが setupComplete を送ってくる
+        // setup メッセージでモデル設定とシステムプロンプトを送信
+        ws.send(JSON.stringify({
+          setup: {
+            model: `models/${model}`,
+            generationConfig: {
+              responseModalities: ["AUDIO"],
+              speechConfig: {
+                voiceConfig: { prebuiltVoiceConfig: { voiceName: "Aoede" } },
+              },
+            },
+            systemInstruction: {
+              parts: [{ text: systemPrompt }],
+            },
+          },
+        }));
       };
 
       ws.onmessage = (event) => {

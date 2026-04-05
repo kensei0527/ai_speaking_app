@@ -1255,56 +1255,50 @@ async def issue_live_token(
 
     system_prompt = conversation_service.build_system_prompt(chapter.title, phrases[:20])
 
-    # ─ Gemini API v1alpha で ephemeral token 発行 ────────────────────────────
-    now = datetime.datetime.now(tz=datetime.timezone.utc)
 
-    token_request_body = {
-        "uses": 1,
-        "expireTime": (now + datetime.timedelta(minutes=30)).isoformat(),
-        "newSessionExpireTime": (now + datetime.timedelta(minutes=2)).isoformat(),
-        "liveConnectConstraints": {
-            "model": f"models/{conversation_service.LIVE_API_MODEL}",
-            "config": {
-                "responseModalities": ["AUDIO"],
-                "speechConfig": {
-                    "voiceConfig": {
-                        "prebuiltVoiceConfig": {"voiceName": "Aoede"}
-                    }
-                },
-                "systemInstruction": {
-                    "parts": [{"text": system_prompt}]
-                },
-            },
-        },
-    }
-
+    # ─ google-genai SDK で ephemeral token 発行（公式サンプル準拠）─────────────
     try:
+        from google import genai as google_genai
+
         gemini_api_key = os.getenv("GEMINI_API_KEY", "")
-        response = httpx.post(
-            f"https://generativelanguage.googleapis.com/v1alpha/authTokens?key={gemini_api_key}",
-            json=token_request_body,
-            timeout=10.0,
+        if not gemini_api_key:
+            raise HTTPException(status_code=500, detail="GEMINI_API_KEY not configured")
+
+        genai_client = google_genai.Client(
+            api_key=gemini_api_key,
+            http_options={"api_version": "v1alpha"},
         )
-        response.raise_for_status()
-        token_data = response.json()
-        # token_data["name"] がトークン文字列
-        ephemeral_token = token_data.get("name", "")
+
+        now = datetime.datetime.now(tz=datetime.timezone.utc)
+        expire_time = now + datetime.timedelta(minutes=30)
+
+        token = genai_client.auth_tokens.create(
+            config={
+                "uses": 1,
+                "expire_time": expire_time.isoformat(),
+                "new_session_expire_time": (now + datetime.timedelta(minutes=2)).isoformat(),
+                "http_options": {"api_version": "v1alpha"},
+            }
+        )
+        ephemeral_token = token.name
         if not ephemeral_token:
-            raise HTTPException(status_code=502, detail="Failed to extract token from Gemini response")
-    except httpx.HTTPStatusError as e:
-        raise HTTPException(
-            status_code=502,
-            detail=f"Gemini API error: {e.response.status_code} {e.response.text}",
-        )
+            raise HTTPException(status_code=502, detail="Empty token from Gemini")
+
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=502, detail=f"Token issuance failed: {str(e)}")
 
+    # フロントはこのトークンで v1alpha WSS に直接接続する
+    # システムプロンプトはフロント側の setup メッセージで送る（APIキー非公開は維持）
     return {
         "token": ephemeral_token,
-        "expires_in_seconds": 120,  # new_session_expire_time に合わせた目安
+        "chapter_title": chapter.title,
+        "phrases": phrases[:20],
+        "model": conversation_service.LIVE_API_MODEL,
         "ws_url": (
             "wss://generativelanguage.googleapis.com/ws/"
-            "google.ai.generativelanguage.v1alpha.GenerativeService.BidiGenerateContentConstrained"
+            "google.ai.generativelanguage.v1alpha.GenerativeService.BidiGenerateContent"
             f"?access_token={ephemeral_token}"
         ),
     }
