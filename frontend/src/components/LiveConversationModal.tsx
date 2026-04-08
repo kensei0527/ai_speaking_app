@@ -191,19 +191,14 @@ export default function LiveConversationModal({
       if (msg.setupComplete) {
         setStatus("connected");
         // ユーザーの代わりに最初の一言をシミュレートしてAIに話させる
-        wsRef.current?.send(
-          JSON.stringify({
-            clientContent: {
-              turns: [
-                {
-                  role: "user",
-                  parts: [{ text: "(The student is ready. Please begin.)" }],
-                },
-              ],
-              turnComplete: true,
-            },
-          })
-        );
+        // clientContent ではなく realtimeInput を使う方が堅実です
+        const initMsg = {
+          realtimeInput: {
+            text: "(The student is ready. Please begin.)",
+          },
+        };
+        console.log("Sending initial trigger message:", JSON.stringify(initMsg, null, 2));
+        wsRef.current?.send(JSON.stringify(initMsg));
         return;
       }
 
