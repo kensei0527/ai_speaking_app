@@ -379,18 +379,19 @@ ${phraseList}
           JSON.stringify({
             setup: {
               model: `models/${model}`,
-              generationConfig: {
-                responseModalities: ["AUDIO"],
-                speechConfig: {
-                  voiceConfig: {
-                    prebuiltVoiceConfig: { voiceName: "Aoede" },
+              generation_config: {
+                response_modalities: ["AUDIO"],
+                speech_config: {
+                  voice_config: {
+                    prebuilt_voice_config: {
+                      voice_name: "Aoede",
+                    },
                   },
                 },
               },
-              systemInstruction: { parts: [{ text: systemPrompt }] },
-              // 転写を両方有効化
-              inputAudioTranscription: {},
-              outputAudioTranscription: {},
+              system_instruction: {
+                parts: [{ text: systemPrompt }],
+              },
             },
           })
         );
