@@ -16,12 +16,6 @@ import {
   CheckCircle,
 } from "lucide-react";
 
-// SpeechRecognition Types
-interface IWindow extends Window {
-  webkitSpeechRecognition: any;
-  SpeechRecognition: any;
-}
-
 const API_URL = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
 
 const LIVE_WSS_BASE =
@@ -114,7 +108,6 @@ export default function LiveConversationModal({
   const audioCtxRef = useRef<AudioContext | null>(null);
   const mediaStreamRef = useRef<MediaStream | null>(null);
   const workletNodeRef = useRef<AudioWorkletNode | null>(null);
-  const recognitionRef = useRef<any>(null); // Web Speech API
   const audioQueueRef = useRef<Float32Array<ArrayBuffer>[]>([]);
   const isPlayingRef = useRef(false);
   const isMutedRef = useRef(false);
@@ -122,14 +115,13 @@ export default function LiveConversationModal({
 
   // Live transcription accumulator refs
   const liveAIRef = useRef("");
-  const liveUserRef = useRef("");
+  const liveUserRef = useRef(""); // Accumulated behind the scenes for evaluation
 
   // State
   const [status, setStatus] = useState<Status>("idle");
   const [isMuted, setIsMuted] = useState(false);
   const [transcript, setTranscript] = useState<TranscriptEntry[]>([]);
   const [liveAIText, setLiveAIText] = useState("");
-  const [liveUserText, setLiveUserText] = useState("");
   const [isAISpeaking, setIsAISpeaking] = useState(false);
   const [errorMsg, setErrorMsg] = useState("");
   const [userLevel, setUserLevel] = useState("Beginner");
@@ -147,8 +139,8 @@ export default function LiveConversationModal({
         ...p,
         { role: "user", text, id: entryIdRef.current++ },
       ]);
+      // Reset ref only, we don't display user text in UI anymore
       liveUserRef.current = "";
-      setLiveUserText("");
     }
   }, []);
 
@@ -161,7 +153,7 @@ export default function LiveConversationModal({
       return;
     }
 
-    // AIが話し始めた際に、未確定のユーザー音声があれば強制コミットして吹き出しを分ける
+    // AIが話し始めた際に、未確定のユーザー音声があれば強制コミット
     if (!isPlayingRef.current) {
       commitUserSpeech();
     }
@@ -194,8 +186,6 @@ export default function LiveConversationModal({
     mediaStreamRef.current = null;
     audioCtxRef.current?.close().catch(() => {});
     audioCtxRef.current = null;
-    recognitionRef.current?.stop();
-    recognitionRef.current = null;
 
     const ws = wsRef.current;
     if (ws) {
@@ -209,7 +199,6 @@ export default function LiveConversationModal({
     liveUserRef.current = "";
     setIsAISpeaking(false);
     setLiveAIText("");
-    setLiveUserText("");
   }, []);
 
   // ── Message handler ─────────────────────────────────────────────────────
@@ -249,9 +238,11 @@ export default function LiveConversationModal({
         setLiveAIText(liveAIRef.current);
       }
 
-      // User transcription from Gemini (fallback, we actually rely on WebSpeechAPI for text)
-      // but we USE Gemini's `finished` flag to perfectly sync with its turn taking.
+      // User transcription from Gemini (accumulated silently for evaluation)
       const inTx = sc.inputTranscription as { text?: string; finished?: boolean } | undefined;
+      if (inTx?.text) {
+        liveUserRef.current += inTx.text;
+      }
 
       // Turn complete (AI finished speaking)
       if (sc.turnComplete) {
@@ -278,7 +269,7 @@ export default function LiveConversationModal({
     setEvaluation(null);
     setErrorMsg("");
     setLiveAIText("");
-    setLiveUserText("");
+    liveUserRef.current = "";
 
     try {
       const supabase = createClient();
@@ -348,31 +339,6 @@ ${styleGuide}
 
       setStatus("connecting");
       
-      // Initialize Web Speech API for better UI transcription
-      const win = window as unknown as IWindow;
-      const SpeechRecognition = win.SpeechRecognition || win.webkitSpeechRecognition;
-      if (SpeechRecognition) {
-        const recognition = new SpeechRecognition();
-        recognition.continuous = true;
-        recognition.interimResults = true;
-        recognition.lang = 'en-US';
-        
-        recognition.onresult = (event: any) => {
-          let interim = "";
-          for (let i = event.resultIndex; i < event.results.length; ++i) {
-            if (event.results[i].isFinal) {
-              liveUserRef.current += event.results[i][0].transcript + " ";
-            } else {
-              interim += event.results[i][0].transcript;
-            }
-          }
-          setLiveUserText(liveUserRef.current + interim);
-        };
-        recognition.onerror = () => {};
-        recognition.start();
-        recognitionRef.current = recognition;
-      }
-
       const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
       mediaStreamRef.current = stream;
 
@@ -504,7 +470,7 @@ ${styleGuide}
 
   useEffect(() => {
     transcriptEndRef.current?.scrollIntoView({ behavior: "smooth" });
-  }, [transcript, liveAIText, liveUserText, status]);
+  }, [transcript, liveAIText, status]);
 
   useEffect(() => {
     if (!isOpen) {
@@ -635,7 +601,7 @@ ${styleGuide}
 
             {!isEvaluating && !isEvaluated && (
               <>
-                {transcript.length === 0 && !liveAIText && !liveUserText && (
+                {transcript.length === 0 && !liveAIText && (
                   <div className="flex flex-col items-center justify-center h-full gap-4 opacity-40 py-20 pb-20">
                     {!isActive && !isBusy && (
                       <>
@@ -649,16 +615,13 @@ ${styleGuide}
                   </div>
                 )}
 
-                {transcript.map((entry) => (
-                  <div key={entry.id} className={`flex items-start gap-3 ${entry.role === "user" ? "flex-row-reverse" : ""}`}>
-                    <div className={`w-8 h-8 rounded-xl flex items-center justify-center border flex-shrink-0 ${
-                      entry.role === "user" ? "bg-indigo-500/20 border-indigo-400/30" : "bg-white/5 border-white/10"
-                    }`}>
-                      {entry.role === "user" ? <User className="w-4 h-4 text-indigo-300" /> : <Bot className="w-4 h-4 text-white/50" />}
+                {/* Only display AI transcript in UI */}
+                {transcript.filter(t => t.role === "model").map((entry) => (
+                  <div key={entry.id} className="flex items-start gap-3">
+                    <div className="w-8 h-8 rounded-xl flex items-center justify-center border flex-shrink-0 bg-white/5 border-white/10">
+                      <Bot className="w-4 h-4 text-white/50" />
                     </div>
-                    <div className={`max-w-[85%] px-4 py-3 rounded-2xl text-sm leading-relaxed shadow-sm ${
-                      entry.role === "user" ? "bg-indigo-600/60 text-white rounded-tr-none" : "bg-white/5 text-indigo-50 border border-white/5 rounded-tl-none"
-                    }`}>
+                    <div className="max-w-[85%] px-4 py-3 rounded-2xl text-sm leading-relaxed shadow-sm bg-white/5 text-indigo-50 border border-white/5 rounded-tl-none">
                       {entry.text}
                     </div>
                   </div>
@@ -672,17 +635,6 @@ ${styleGuide}
                     <div className="max-w-[85%] px-4 py-3 rounded-2xl rounded-tl-none bg-white/5 text-indigo-50 border border-white/5 text-sm leading-relaxed relative">
                       {liveAIText}
                       <motion.span animate={{ opacity: [1, 0] }} transition={{ repeat: Infinity, duration: 0.8 }} className="inline-block w-1.5 h-4 bg-indigo-400/50 ml-1 rounded-sm align-middle" />
-                    </div>
-                  </div>
-                )}
-
-                {liveUserText && (
-                  <div className="flex items-start gap-3 flex-row-reverse">
-                    <div className="w-8 h-8 rounded-xl bg-indigo-500/20 border border-indigo-400/30 flex items-center justify-center flex-shrink-0">
-                      <User className="w-4 h-4 text-indigo-300" />
-                    </div>
-                    <div className="max-w-[85%] px-4 py-3 rounded-2xl rounded-tr-none bg-indigo-600/30 text-white/70 text-sm leading-relaxed border border-indigo-400/10">
-                      {liveUserText}
                     </div>
                   </div>
                 )}
@@ -722,9 +674,9 @@ ${styleGuide}
                   </>
                 )}
               </div>
-              {isActive && !isMuted && (
+              {isActive && !isMuted && !isAISpeaking && (
                 <p className="text-center text-indigo-400/40 text-[10px] mt-4 uppercase tracking-[0.2em] font-medium animate-pulse">
-                  Listening via SpeechRecognition...
+                  Listening for your response...
                 </p>
               )}
             </div>
