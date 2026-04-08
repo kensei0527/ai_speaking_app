@@ -375,29 +375,21 @@ ${phraseList}
       wsRef.current = ws;
 
       ws.onopen = () => {
-        ws.send(
-          JSON.stringify({
-            setup: {
-              model: `models/${model}`,
-              generation_config: {
-                response_modalities: ["AUDIO"],
-                speech_config: {
-                  voice_config: {
-                    prebuilt_voice_config: {
-                      voice_name: "Aoede",
-                    },
-                  },
-                },
-              },
-              system_instruction: {
-                parts: [{ text: systemPrompt }],
-              },
+        console.log("WebSocket opened. Sending setup...");
+        const setupMsg = {
+          setup: {
+            model: `models/${model}`,
+            generation_config: {
+              response_modalities: ["AUDIO"],
             },
-          })
-        );
+          },
+        };
+        console.log("Setup message:", JSON.stringify(setupMsg, null, 2));
+        ws.send(JSON.stringify(setupMsg));
       };
 
       ws.onmessage = (event) => {
+        console.log("Received message:", event.data);
         if (event.data instanceof Blob) {
           event.data.text().then(handleMessage);
         } else {
@@ -405,13 +397,15 @@ ${phraseList}
         }
       };
 
-      ws.onerror = () => {
+      ws.onerror = (e) => {
+        console.error("WebSocket Error:", e);
         setErrorMsg("接続エラーが発生しました。");
         setStatus("error");
         cleanup();
       };
 
       ws.onclose = (e) => {
+        console.warn(`WebSocket closed: code=${e.code}, reason=${e.reason}`);
         if (e.code !== 1000) {
           setErrorMsg(
             `接続が切断されました (code: ${e.code})` +
@@ -424,6 +418,7 @@ ${phraseList}
         cleanup();
       };
     } catch (err: unknown) {
+      console.error("Start session error:", err);
       setErrorMsg(err instanceof Error ? err.message : String(err));
       setStatus("error");
       cleanup();
