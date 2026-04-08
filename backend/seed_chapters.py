@@ -184,7 +184,8 @@ You are an expert English teacher creating "Instant English Composition" (瞬間
 - Description: {scenario_desc}
 
 ## Instructions
-Create {count} high-quality, natural questions that perfectly fit this specific scenario.
+Create {count} high-quality, natural conversational phrases that perfectly fit this specific scenario.
+You MUST include a well-balanced mix of statements (肯定文), negative sentences (否定文), short natural responses/reactions (相槌・返答), and a few questions (疑問文). Do not just make a list of questions. Make it feel like fragments of a real dialogue.
 Use the target grammar points. Vary the difficulty across the {count} questions (spread from 1 to 5).
 The sentences should be extremely natural for spoken English in this situation.
 
