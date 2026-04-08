@@ -374,13 +374,25 @@ ${phraseList}
       );
       wsRef.current = ws;
 
+      ws.onmessage = (event) => {
+        if (event.data instanceof Blob) {
+          event.data.text().then((txt) => {
+            console.log("Received Blob message (decoded):", txt);
+            handleMessage(txt);
+          });
+        } else {
+          console.log("Received string message:", event.data);
+          handleMessage(event.data as string);
+        }
+      };
+
       ws.onopen = () => {
         console.log("WebSocket opened. Sending setup...");
         const setupMsg = {
           setup: {
             model: `models/${model}`,
-            generation_config: {
-              response_modalities: ["AUDIO"],
+            generationConfig: {
+              responseModalities: ["AUDIO"],
             },
           },
         };
@@ -388,17 +400,8 @@ ${phraseList}
         ws.send(JSON.stringify(setupMsg));
       };
 
-      ws.onmessage = (event) => {
-        console.log("Received message:", event.data);
-        if (event.data instanceof Blob) {
-          event.data.text().then(handleMessage);
-        } else {
-          handleMessage(event.data as string);
-        }
-      };
-
       ws.onerror = (e) => {
-        console.error("WebSocket Error:", e);
+        console.error("WebSocket Error (event):", e);
         setErrorMsg("接続エラーが発生しました。");
         setStatus("error");
         cleanup();
