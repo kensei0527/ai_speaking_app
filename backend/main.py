@@ -1304,6 +1304,10 @@ async def issue_live_token(
     else:
         user_level = "Beginner"
 
+    # Get the first scenario of the chapter to use as roleplay context
+    first_scenario = db.query(models.Scenario).filter(models.Scenario.chapter_id == chapter_id).order_by(models.Scenario.order_index).first()
+    scenario_context = f"Scenario: {first_scenario.title}\n{first_scenario.description}" if first_scenario else ""
+
     # フロントはこのトークンで v1alpha WSS に直接接続する
     # システムプロンプトはフロント側の setup メッセージで送る（APIキー非公開は維持）
     return {
@@ -1313,12 +1317,37 @@ async def issue_live_token(
         "model": conversation_service.LIVE_API_MODEL,
         "user_level": user_level,
         "cefr_level": chapter.cefr_level,
+        "scenario_context": scenario_context,
         "ws_url": (
             "wss://generativelanguage.googleapis.com/ws/"
             "google.ai.generativelanguage.v1alpha.GenerativeService.BidiGenerateContent"
             f"?access_token={ephemeral_token}"
         ),
     }
+
+@app.post("/api/chapters/{chapter_id}/evaluate-conversation", response_model=schemas.ConversationEvaluationResponse)
+async def evaluate_conversation_endpoint(
+    chapter_id: int, 
+    request: schemas.ConversationEvaluationRequest,
+    db: Session = Depends(database.get_db),
+    user: models.User = Depends(auth.get_current_user)
+):
+    """
+    Evaluates an entire Live Conversation transcript and returns detailed feedback.
+    """
+    chapter = db.query(models.Chapter).filter(models.Chapter.id == chapter_id).first()
+    if not chapter:
+        raise HTTPException(status_code=404, detail="Chapter not found")
+        
+    questions = db.query(models.Question).filter(models.Question.chapter_id == chapter_id).all()
+    phrases = [q.expected_english_text for q in questions]
+
+    feedback = ai_service.evaluate_conversation_history(
+        transcript=request.transcript,
+        chapter_title=chapter.title,
+        phrases=phrases[:20]
+    )
+    return feedback
 
 
 if __name__ == "__main__":

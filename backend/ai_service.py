@@ -348,3 +348,75 @@ Output ONLY a JSON object with the following keys:
             alternative_expressions=[],
             naturalness_tips=[],
         )
+
+
+def evaluate_conversation_history(transcript, chapter_title: str, phrases: List[str]):
+    """
+    Evaluates the full transcript of a live conversation session.
+    Returns: { overall_score, summary, strengths, improvement_areas, alternative_phrases }
+    """
+    model = get_model()
+    
+    # Format the transcript for the prompt
+    transcript_text = ""
+    for entry in transcript:
+        role = "AI Coach" if entry.role == "model" else "Student"
+        transcript_text += f"{role}: {entry.text}\n"
+
+    phrase_str = "\n".join(f"- {p}" for p in phrases) if phrases else "(なし)"
+
+    prompt = f"""
+You are an expert English conversation evaluator.
+Review the following transcript of a live English conversation practice session.
+The student played a roleplay interacting with an AI coach based on Chapter: "{chapter_title}".
+
+Target Phrases for this chapter:
+{phrase_str}
+
+Conversation Transcript:
+{transcript_text}
+
+Provide a comprehensive, encouraging evaluation IN JAPANESE for the student.
+Output ONLY a valid JSON object matching this structure exactly:
+{{
+  "overall_score": <int: 0 to 100 based on fluency, grammar, and engagement>,
+  "summary": "<string: A 2-3 sentence overall encouraging feedback in Japanese>",
+  "strengths": [
+    "<string: Specific praise (e.g., 'You used the phrase X naturally', 'Good pronunciation implication') in Japanese>"
+  ],
+  "improvement_areas": [
+    "<string: Specific, constructive correction (e.g., 'Instead of saying X, say Y') in Japanese>"
+  ],
+  "alternative_phrases": [
+    "<string: 2-3 English phrases that could have made their responses sound more native>"
+  ]
+}}
+"""
+    try:
+        response = model.generate_content(prompt)
+        text = response.text.strip()
+        if text.startswith("```json"):
+            text = text[7:]
+        if text.startswith("```"):
+            text = text[3:]
+        if text.endswith("```"):
+            text = text[:-3]
+        
+        data = json.loads(text.strip())
+        from schemas import ConversationEvaluationResponse
+        return dict(
+            overall_score=float(data.get("overall_score", 0)),
+            summary=data.get("summary", "評価できませんでした。"),
+            strengths=data.get("strengths", []),
+            improvement_areas=data.get("improvement_areas", []),
+            alternative_phrases=data.get("alternative_phrases", [])
+        )
+    except Exception as e:
+        print(f"Error evaluating conversation: {e}")
+        return dict(
+            overall_score=0.0,
+            summary="サーバーエラーにより評価できませんでした。\n通信状況を確認して再度お試しください。",
+            strengths=[],
+            improvement_areas=[],
+            alternative_phrases=[]
+        )

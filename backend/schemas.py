@@ -212,3 +212,20 @@ class UserStatsResponse(BaseModel):
     overall_accuracy: float
     weak_points: List[WeakPointInfo] = []
     chapter_progress: List[ChapterResponse] = []
+
+
+# ─── Conversation Evaluation Schemas ──────────────────────────────────────────
+
+class TranscriptEntry(BaseModel):
+    role: str
+    text: str
+
+class ConversationEvaluationRequest(BaseModel):
+    transcript: List[TranscriptEntry]
+
+class ConversationEvaluationResponse(BaseModel):
+    overall_score: float
+    summary: str
+    strengths: List[str]
+    improvement_areas: List[str]
+    alternative_phrases: List[str]
