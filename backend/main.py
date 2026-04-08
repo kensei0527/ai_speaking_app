@@ -1289,6 +1289,21 @@ async def issue_live_token(
     except Exception as e:
         raise HTTPException(status_code=502, detail=f"Token issuance failed: {str(e)}")
 
+    # ユーザーの習熟度レベルを判定
+    # get_user_stats と同様のロジックを使用
+    chapters_mastered = db.query(models.UserChapterProgress).filter(
+        models.UserChapterProgress.user_id == user.id,
+        models.UserChapterProgress.status == "mastered"
+    ).count()
+    
+    avg_proficiency = user.proficiency_score
+    if chapters_mastered >= 7 and avg_proficiency >= 70:
+        user_level = "Advanced"
+    elif chapters_mastered >= 3 and avg_proficiency >= 50:
+        user_level = "Intermediate"
+    else:
+        user_level = "Beginner"
+
     # フロントはこのトークンで v1alpha WSS に直接接続する
     # システムプロンプトはフロント側の setup メッセージで送る（APIキー非公開は維持）
     return {
@@ -1296,6 +1311,8 @@ async def issue_live_token(
         "chapter_title": chapter.title,
         "phrases": phrases[:20],
         "model": conversation_service.LIVE_API_MODEL,
+        "user_level": user_level,
+        "cefr_level": chapter.cefr_level,
         "ws_url": (
             "wss://generativelanguage.googleapis.com/ws/"
             "google.ai.generativelanguage.v1alpha.GenerativeService.BidiGenerateContent"
