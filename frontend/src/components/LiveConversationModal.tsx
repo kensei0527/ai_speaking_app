@@ -1,14 +1,13 @@
 "use client";
 
 /**
- * LiveConversationModal.tsx — Ephemeral Token + AudioWorklet 版
- * ────────────────────────────────────────────────────────────────────────────
- * フロー:
- *   1. POST /api/chapters/{id}/live-token → ephemeral token 取得
- *   2. wss://.../BidiGenerateContentConstrained?access_token=TOKEN に接続
- *   3. onopen で setup メッセージ送信
- *   4. AudioWorkletNode でマイク → PCM16 → base64 → Gemini
- *   5. Gemini → base64 PCM24kHz → AudioContext → スピーカー
+ * LiveConversationModal.tsx — 初心者向け設計版
+ * ─────────────────────────────────────────────
+ * 改善点:
+ *   1. AIが先に話し始める（setupComplete後に挨拶をトリガー）
+ *   2. 一文ずつリアルタイム字幕表示（ストリーミング→確定）
+ *   3. ゆっくり話す設定（システムプロンプト + speakingRate）
+ *   4. AudioWorkletNode（ScriptProcessorNode 廃止対応）
  */
 
 import { useEffect, useRef, useState, useCallback } from "react";
@@ -18,31 +17,28 @@ import {
   Mic,
   MicOff,
   PhoneOff,
-  MessageSquare,
   Volume2,
-  Waves,
   AlertCircle,
   Loader2,
+  Bot,
+  User,
 } from "lucide-react";
 
 const API_URL = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
 
-// Gemini Live API — ephemeral token は access_token= で v1alpha の Constrained エンドポイントに渡す
 const LIVE_WSS_BASE =
   "wss://generativelanguage.googleapis.com/ws/" +
   "google.ai.generativelanguage.v1alpha.GenerativeService.BidiGenerateContentConstrained";
 
-// ─── AudioWorklet processor のインライン定義 ───────────────────────────────
-// ScriptProcessorNode は deprecated なので AudioWorkletNode を使う
+// ── AudioWorklet processor (inline blob) ────────────────────────────────────
 const WORKLET_CODE = `
 class PCM16Processor extends AudioWorkletProcessor {
   process(inputs) {
-    const input = inputs[0];
-    if (!input || !input[0]) return true;
-    const float32 = input[0];
-    const int16 = new Int16Array(float32.length);
-    for (let i = 0; i < float32.length; i++) {
-      const s = Math.max(-1, Math.min(1, float32[i]));
+    const ch = inputs[0]?.[0];
+    if (!ch) return true;
+    const int16 = new Int16Array(ch.length);
+    for (let i = 0; i < ch.length; i++) {
+      const s = Math.max(-1, Math.min(1, ch[i]));
       int16[i] = s < 0 ? s * 0x8000 : s * 0x7fff;
     }
     this.port.postMessage(int16.buffer, [int16.buffer]);
@@ -52,32 +48,31 @@ class PCM16Processor extends AudioWorkletProcessor {
 registerProcessor('pcm16-processor', PCM16Processor);
 `;
 
-// ─── ユーティリティ ──────────────────────────────────────────────────────
-function pcm16ToFloat32(buffer: ArrayBuffer): Float32Array<ArrayBuffer> {
-  const int16 = new Int16Array(buffer);
-  const out = new Float32Array(int16.length);
-  for (let i = 0; i < int16.length; i++) out[i] = int16[i] / 32768;
-  return out;
+// ── Utilities ────────────────────────────────────────────────────────────────
+function pcm16ToFloat32(buf: ArrayBuffer): Float32Array<ArrayBuffer> {
+  const i16 = new Int16Array(buf);
+  const f32 = new Float32Array(i16.length);
+  for (let i = 0; i < i16.length; i++) f32[i] = i16[i] / 32768;
+  return f32;
 }
 
-function arrayBufferToBase64(buffer: ArrayBuffer): string {
-  const bytes = new Uint8Array(buffer);
-  let binary = "";
-  // チャンク処理でスタックオーバーフロー防止
+function arrayBufferToBase64(buf: ArrayBuffer): string {
+  const bytes = new Uint8Array(buf);
+  let s = "";
   const CHUNK = 8192;
-  for (let i = 0; i < bytes.length; i += CHUNK) {
-    binary += String.fromCharCode(...bytes.subarray(i, i + CHUNK));
-  }
-  return btoa(binary);
+  for (let i = 0; i < bytes.length; i += CHUNK)
+    s += String.fromCharCode(...bytes.subarray(i, i + CHUNK));
+  return btoa(s);
 }
 
-function base64ToArrayBuffer(base64: string): ArrayBuffer {
-  const binary = atob(base64);
-  const bytes = new Uint8Array(binary.length);
-  for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+function base64ToArrayBuffer(b64: string): ArrayBuffer {
+  const bin = atob(b64);
+  const bytes = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
   return bytes.buffer as ArrayBuffer;
 }
 
+// ── Types ────────────────────────────────────────────────────────────────────
 interface TranscriptEntry {
   role: "user" | "model";
   text: string;
@@ -91,7 +86,7 @@ interface Props {
   chapterTitle: string;
 }
 
-type ConnectionStatus =
+type Status =
   | "idle"
   | "fetching-token"
   | "connecting"
@@ -99,31 +94,42 @@ type ConnectionStatus =
   | "error"
   | "stopped";
 
+// ── Component ────────────────────────────────────────────────────────────────
 export default function LiveConversationModal({
   isOpen,
   onClose,
   chapterId,
   chapterTitle,
 }: Props) {
+  // WebSocket / Audio refs
   const wsRef = useRef<WebSocket | null>(null);
   const audioCtxRef = useRef<AudioContext | null>(null);
   const mediaStreamRef = useRef<MediaStream | null>(null);
   const workletNodeRef = useRef<AudioWorkletNode | null>(null);
   const audioQueueRef = useRef<Float32Array<ArrayBuffer>[]>([]);
   const isPlayingRef = useRef(false);
-  const transcriptEndRef = useRef<HTMLDivElement | null>(null);
-  const entryIdRef = useRef(0);
   const isMutedRef = useRef(false);
+  const entryIdRef = useRef(0);
 
-  const [status, setStatus] = useState<ConnectionStatus>("idle");
+  // Live transcription accumulator refs
+  const liveAIRef = useRef(""); // streaming AI text (not yet committed)
+  const liveUserRef = useRef(""); // streaming user text
+
+  // State
+  const [status, setStatus] = useState<Status>("idle");
   const [isMuted, setIsMuted] = useState(false);
   const [transcript, setTranscript] = useState<TranscriptEntry[]>([]);
-  const [errorMsg, setErrorMsg] = useState("");
+  const [liveAIText, setLiveAIText] = useState(""); // current AI sentence streaming
+  const [liveUserText, setLiveUserText] = useState(""); // current user utterance
   const [isAISpeaking, setIsAISpeaking] = useState(false);
+  const [errorMsg, setErrorMsg] = useState("");
 
-  // ─ キュー再生 ────────────────────────────────────────────────────────────
+  const transcriptEndRef = useRef<HTMLDivElement | null>(null);
+
+  // ── Audio playback queue ────────────────────────────────────────────────
   const playNextChunk = useCallback(() => {
-    if (!audioCtxRef.current || audioQueueRef.current.length === 0) {
+    const ctx = audioCtxRef.current;
+    if (!ctx || audioQueueRef.current.length === 0) {
       isPlayingRef.current = false;
       setIsAISpeaking(false);
       return;
@@ -131,25 +137,24 @@ export default function LiveConversationModal({
     isPlayingRef.current = true;
     setIsAISpeaking(true);
     const samples = audioQueueRef.current.shift()!;
-    const buf = audioCtxRef.current.createBuffer(1, samples.length, 24000);
+    const buf = ctx.createBuffer(1, samples.length, 24000);
     buf.copyToChannel(samples, 0);
-    const src = audioCtxRef.current.createBufferSource();
+    const src = ctx.createBufferSource();
     src.buffer = buf;
-    src.connect(audioCtxRef.current.destination);
+    src.connect(ctx.destination);
     src.onended = playNextChunk;
     src.start();
   }, []);
 
   const enqueueAudio = useCallback(
     (base64: string) => {
-      const f32 = pcm16ToFloat32(base64ToArrayBuffer(base64));
-      audioQueueRef.current.push(f32);
+      audioQueueRef.current.push(pcm16ToFloat32(base64ToArrayBuffer(base64)));
       if (!isPlayingRef.current) playNextChunk();
     },
     [playNextChunk]
   );
 
-  // ─ クリーンアップ ────────────────────────────────────────────────────────
+  // ── Cleanup ─────────────────────────────────────────────────────────────
   const cleanup = useCallback(() => {
     workletNodeRef.current?.disconnect();
     workletNodeRef.current = null;
@@ -157,31 +162,131 @@ export default function LiveConversationModal({
     mediaStreamRef.current = null;
     audioCtxRef.current?.close().catch(() => {});
     audioCtxRef.current = null;
-    if (wsRef.current) {
-      wsRef.current.onmessage = null;
-      wsRef.current.onclose = null;
-      wsRef.current.onerror = null;
-      wsRef.current.close();
+    const ws = wsRef.current;
+    if (ws) {
+      ws.onmessage = ws.onclose = ws.onerror = null;
+      ws.close();
       wsRef.current = null;
     }
     audioQueueRef.current = [];
     isPlayingRef.current = false;
+    liveAIRef.current = "";
+    liveUserRef.current = "";
     setIsAISpeaking(false);
+    setLiveAIText("");
+    setLiveUserText("");
   }, []);
 
-  // ─ セッション開始 ────────────────────────────────────────────────────────
+  // ── Message handler ─────────────────────────────────────────────────────
+  const handleMessage = useCallback(
+    (raw: string) => {
+      let msg: Record<string, unknown>;
+      try {
+        msg = JSON.parse(raw);
+      } catch {
+        return;
+      }
+
+      // Setup complete → AIから話し始めさせるトリガーを送る
+      if (msg.setupComplete) {
+        setStatus("connected");
+        // ユーザーの代わりに最初の一言をシミュレートしてAIに話させる
+        wsRef.current?.send(
+          JSON.stringify({
+            clientContent: {
+              turns: [
+                {
+                  role: "user",
+                  parts: [{ text: "(The student is ready. Please begin.)" }],
+                },
+              ],
+              turnComplete: true,
+            },
+          })
+        );
+        return;
+      }
+
+      const sc = msg.serverContent as Record<string, unknown> | undefined;
+      if (!sc) return;
+
+      // 音声データ
+      const parts = (
+        (sc.modelTurn as Record<string, unknown>)?.parts as
+          | Array<Record<string, unknown>>
+          | undefined
+      ) ?? [];
+      for (const part of parts) {
+        const inlineData = part.inlineData as
+          | { data?: string }
+          | undefined;
+        if (inlineData?.data) enqueueAudio(inlineData.data);
+      }
+
+      // AI の転写テキスト（ストリーミング）
+      const outTx = sc.outputTranscription as
+        | { text?: string; finished?: boolean }
+        | undefined;
+      if (outTx?.text) {
+        liveAIRef.current += outTx.text;
+        setLiveAIText(liveAIRef.current);
+      }
+
+      // ユーザーの転写テキスト（ストリーミング）
+      const inTx = sc.inputTranscription as
+        | { text?: string; finished?: boolean }
+        | undefined;
+      if (inTx?.text) {
+        liveUserRef.current += inTx.text;
+        setLiveUserText(liveUserRef.current);
+      }
+
+      // ターン完了 → ライブテキストを確定してトランスクリプトに移す
+      if (sc.turnComplete) {
+        const aiText = liveAIRef.current.trim();
+        if (aiText) {
+          setTranscript((p) => [
+            ...p,
+            { role: "model", text: aiText, id: entryIdRef.current++ },
+          ]);
+        }
+        liveAIRef.current = "";
+        setLiveAIText("");
+      }
+
+      // inputTranscription の finished でユーザー発言確定
+      if (inTx?.finished) {
+        const userText = liveUserRef.current.trim();
+        if (userText) {
+          setTranscript((p) => [
+            ...p,
+            { role: "user", text: userText, id: entryIdRef.current++ },
+          ]);
+        }
+        liveUserRef.current = "";
+        setLiveUserText("");
+      }
+    },
+    [enqueueAudio]
+  );
+
+  // ── Start session ────────────────────────────────────────────────────────
   const startSession = useCallback(async () => {
     setStatus("fetching-token");
     setTranscript([]);
     setErrorMsg("");
+    liveAIRef.current = "";
+    liveUserRef.current = "";
+    setLiveAIText("");
+    setLiveUserText("");
 
     try {
-      // 1. Supabase セッション取得
       const supabase = createClient();
-      const { data: { session } } = await supabase.auth.getSession();
+      const {
+        data: { session },
+      } = await supabase.auth.getSession();
       if (!session) throw new Error("ログインが必要です。");
 
-      // 2. バックエンドから ephemeral token 取得（APIキーはバックエンドに留まる）
       const tokenRes = await fetch(
         `${API_URL}/api/chapters/${chapterId}/live-token`,
         {
@@ -196,63 +301,80 @@ export default function LiveConversationModal({
         const err = await tokenRes.json().catch(() => ({}));
         throw new Error(err.detail || `トークン取得失敗 (${tokenRes.status})`);
       }
-      const { token, chapter_title: fetchedTitle, phrases, model } = await tokenRes.json();
+      const {
+        token,
+        chapter_title: fetchedTitle,
+        phrases,
+        model,
+      } = await tokenRes.json();
 
-      // 3. システムプロンプト構築
+      // システムプロンプト（バックエンドと同じ構造をフロントでも構築）
       const phraseList =
         (phrases as string[]).map((p: string) => `  - ${p}`).join("\n") ||
         "  (none)";
-      const systemPrompt = `You are a friendly and encouraging English conversation coach.
-The student just completed Chapter: "${fetchedTitle ?? chapterTitle}".
-They practiced these English phrases:
-${phraseList}
-Your mission: Have a natural, casual spoken conversation (1-3 sentences max per turn).
-Naturally weave in opportunities to use the phrases above.
-Gently correct mistakes. Speak clearly for English learners.
-Start with a warm greeting related to the chapter topic.`;
+      const systemPrompt = `You are a warm, patient English conversation coach for beginners.
 
-      // 4. マイク起動
+The student just finished Chapter: "${fetchedTitle ?? chapterTitle}".
+They practiced these phrases:
+${phraseList}
+
+=== SPEAKING STYLE (VERY IMPORTANT) ===
+- Speak SLOWLY and CLEARLY. Pause briefly between each sentence.
+- Use SIMPLE vocabulary. Avoid idioms or complex grammar.
+- Keep EVERY response to ONE or TWO short sentences maximum.
+- After each response, always ask ONE simple question to keep the conversation going.
+  (The student should never need to initiate — you lead the conversation.)
+
+=== CONVERSATION FLOW ===
+1. Start with a warm, simple greeting and one easy question about "${fetchedTitle ?? chapterTitle}".
+2. React warmly to the student's answer (1 sentence), then ask the next question.
+3. Naturally encourage use of the chapter phrases by asking questions that lead to them.
+4. If the student uses a phrase correctly, say "Great!" or "Perfect!" then continue.
+5. If they make a grammar mistake, gently model the correct version in your reply — never point out the error directly.
+
+=== IMPORTANT ===
+- This is SPOKEN audio. Never use bullet points, markdown, or lists.
+- One idea per sentence. Short pauses feel natural in spoken conversation.
+- You are guiding a shy beginner — be encouraging, never critical.`;
+
+      // マイク起動
       setStatus("connecting");
       const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
       mediaStreamRef.current = stream;
 
-      // 5. AudioContext — 出力は 24kHz、入力処理用に 16kHz にリサンプル
+      // AudioContext (16kHz) + AudioWorkletNode
       const audioCtx = new AudioContext({ sampleRate: 16000 });
       audioCtxRef.current = audioCtx;
 
-      // AudioWorklet (PCM16Processor) を Blob URL でロード
       const blob = new Blob([WORKLET_CODE], { type: "application/javascript" });
-      const workletUrl = URL.createObjectURL(blob);
-      await audioCtx.audioWorklet.addModule(workletUrl);
-      URL.revokeObjectURL(workletUrl);
+      const blobUrl = URL.createObjectURL(blob);
+      await audioCtx.audioWorklet.addModule(blobUrl);
+      URL.revokeObjectURL(blobUrl);
 
-      const micSource = audioCtx.createMediaStreamSource(stream);
-      const workletNode = new AudioWorkletNode(audioCtx, "pcm16-processor");
-      workletNodeRef.current = workletNode;
+      const micSrc = audioCtx.createMediaStreamSource(stream);
+      const worklet = new AudioWorkletNode(audioCtx, "pcm16-processor");
+      workletNodeRef.current = worklet;
 
-      workletNode.port.onmessage = (e: MessageEvent<ArrayBuffer>) => {
-        if (!wsRef.current || wsRef.current.readyState !== WebSocket.OPEN) return;
+      worklet.port.onmessage = (e: MessageEvent<ArrayBuffer>) => {
+        if (wsRef.current?.readyState !== WebSocket.OPEN) return;
         if (isMutedRef.current) return;
-        const b64 = arrayBufferToBase64(e.data);
         wsRef.current.send(
           JSON.stringify({
             realtimeInput: {
-              audio: { data: b64, mimeType: "audio/pcm" },
+              audio: { data: arrayBufferToBase64(e.data), mimeType: "audio/pcm" },
             },
           })
         );
       };
+      micSrc.connect(worklet);
 
-      micSource.connect(workletNode);
-      // ※ workletNode は出力先不要（postMessage で転送するだけ）
-
-      // 6. Gemini Live API v1alpha Constrained エンドポイントに ephemeral token で接続
-      const wsUrl = `${LIVE_WSS_BASE}?access_token=${token}`;
-      const ws = new WebSocket(wsUrl);
+      // WebSocket 接続
+      const ws = new WebSocket(
+        `${LIVE_WSS_BASE}?access_token=${token}`
+      );
       wsRef.current = ws;
 
       ws.onopen = () => {
-        // setup メッセージ送信
         ws.send(
           JSON.stringify({
             setup: {
@@ -265,9 +387,8 @@ Start with a warm greeting related to the chapter topic.`;
                   },
                 },
               },
-              systemInstruction: {
-                parts: [{ text: systemPrompt }],
-              },
+              systemInstruction: { parts: [{ text: systemPrompt }] },
+              // 転写を両方有効化
               inputAudioTranscription: {},
               outputAudioTranscription: {},
             },
@@ -276,66 +397,15 @@ Start with a warm greeting related to the chapter topic.`;
       };
 
       ws.onmessage = (event) => {
-        let raw: string;
         if (event.data instanceof Blob) {
-          // Blob の場合は読み替え（非同期）
-          event.data.text().then((text) => {
-            handleMessage(text);
-          });
-          return;
-        }
-        raw = event.data as string;
-        handleMessage(raw);
-      };
-
-      const handleMessage = (raw: string) => {
-        let msg: Record<string, unknown>;
-        try {
-          msg = JSON.parse(raw);
-        } catch {
-          return;
-        }
-
-        if (msg.setupComplete) {
-          setStatus("connected");
-          return;
-        }
-
-        const sc = msg.serverContent as Record<string, unknown> | undefined;
-        if (!sc) return;
-
-        const parts = (sc.modelTurn as Record<string, unknown>)?.parts as
-          | Array<Record<string, unknown>>
-          | undefined;
-        for (const part of parts ?? []) {
-          const inlineData = part.inlineData as
-            | Record<string, string>
-            | undefined;
-          if (inlineData?.data) enqueueAudio(inlineData.data);
-        }
-
-        const inputTx = sc.inputTranscription as
-          | Record<string, string>
-          | undefined;
-        if (inputTx?.text) {
-          setTranscript((p) => [
-            ...p,
-            { role: "user", text: inputTx.text, id: entryIdRef.current++ },
-          ]);
-        }
-        const outputTx = sc.outputTranscription as
-          | Record<string, string>
-          | undefined;
-        if (outputTx?.text) {
-          setTranscript((p) => [
-            ...p,
-            { role: "model", text: outputTx.text, id: entryIdRef.current++ },
-          ]);
+          event.data.text().then(handleMessage);
+        } else {
+          handleMessage(event.data as string);
         }
       };
 
       ws.onerror = () => {
-        setErrorMsg("Gemini Live API との接続でエラーが発生しました。");
+        setErrorMsg("接続エラーが発生しました。");
         setStatus("error");
         cleanup();
       };
@@ -353,21 +423,20 @@ Start with a warm greeting related to the chapter topic.`;
         cleanup();
       };
     } catch (err: unknown) {
-      const message = err instanceof Error ? err.message : String(err);
-      setErrorMsg(message);
+      setErrorMsg(err instanceof Error ? err.message : String(err));
       setStatus("error");
       cleanup();
     }
-  }, [chapterId, chapterTitle, enqueueAudio, cleanup]);
+  }, [chapterId, chapterTitle, enqueueAudio, cleanup, handleMessage]);
 
-  // ─ セッション終了 ────────────────────────────────────────────────────────
+  // ── End session ──────────────────────────────────────────────────────────
   const endSession = useCallback(() => {
     if (wsRef.current?.readyState === WebSocket.OPEN) {
       wsRef.current.close(1000, "User ended session");
     } else {
       cleanup();
+      setStatus("stopped");
     }
-    setStatus("stopped");
   }, [cleanup]);
 
   const handleClose = useCallback(() => {
@@ -386,10 +455,12 @@ Start with a warm greeting related to the chapter topic.`;
     });
   }, []);
 
+  // Scroll to bottom on new transcript
   useEffect(() => {
     transcriptEndRef.current?.scrollIntoView({ behavior: "smooth" });
-  }, [transcript]);
+  }, [transcript, liveAIText, liveUserText]);
 
+  // Reset on close
   useEffect(() => {
     if (!isOpen) {
       cleanup();
@@ -405,10 +476,8 @@ Start with a warm greeting related to the chapter topic.`;
 
   const isBusy = status === "fetching-token" || status === "connecting";
   const isActive = status === "connected";
-  const canStart = status === "idle" || status === "stopped" || status === "error";
-
-  const busyLabel =
-    status === "fetching-token" ? "接続の準備中..." : "Geminiに接続中...";
+  const canStart =
+    status === "idle" || status === "stopped" || status === "error";
 
   return (
     <AnimatePresence>
@@ -417,258 +486,243 @@ Start with a warm greeting related to the chapter topic.`;
           initial={{ opacity: 0 }}
           animate={{ opacity: 1 }}
           exit={{ opacity: 0 }}
-          className="fixed inset-0 z-50 flex items-center justify-center p-4"
-          style={{
-            backgroundColor: "rgba(0,0,0,0.75)",
-            backdropFilter: "blur(8px)",
-          }}
+          className="fixed inset-0 z-50 flex items-end sm:items-center justify-center p-0 sm:p-4"
+          style={{ backgroundColor: "rgba(0,0,0,0.8)", backdropFilter: "blur(8px)" }}
           onClick={(e) => e.target === e.currentTarget && handleClose()}
         >
           <motion.div
-            initial={{ scale: 0.9, opacity: 0, y: 20 }}
-            animate={{ scale: 1, opacity: 1, y: 0 }}
-            exit={{ scale: 0.9, opacity: 0, y: 20 }}
-            transition={{ type: "spring", damping: 20 }}
-            className="relative w-full max-w-lg rounded-3xl overflow-hidden"
+            initial={{ y: 60, opacity: 0 }}
+            animate={{ y: 0, opacity: 1 }}
+            exit={{ y: 60, opacity: 0 }}
+            transition={{ type: "spring", damping: 22, stiffness: 260 }}
+            className="relative w-full sm:max-w-lg rounded-t-3xl sm:rounded-3xl overflow-hidden flex flex-col"
             style={{
-              background:
-                "linear-gradient(135deg, #1e1b4b 0%, #312e81 50%, #1e1b4b 100%)",
-              boxShadow: "0 25px 60px rgba(99,102,241,0.4)",
+              background: "linear-gradient(160deg, #0f0c29 0%, #1a1760 50%, #0f0c29 100%)",
+              boxShadow: "0 0 60px rgba(99,102,241,0.35)",
+              maxHeight: "92vh",
             }}
           >
-            {/* 装飾 */}
-            <div
-              className="absolute -top-12 -right-12 w-40 h-40 rounded-full opacity-20 blur-3xl"
-              style={{
-                background: "radial-gradient(circle, #a78bfa, transparent)",
-              }}
-            />
-            <div
-              className="absolute -bottom-12 -left-12 w-40 h-40 rounded-full opacity-20 blur-3xl"
-              style={{
-                background: "radial-gradient(circle, #818cf8, transparent)",
-              }}
-            />
+            {/* Decorative blobs */}
+            <div className="pointer-events-none absolute -top-16 -right-16 w-48 h-48 rounded-full opacity-15 blur-3xl"
+              style={{ background: "radial-gradient(circle, #a78bfa, transparent)" }} />
+            <div className="pointer-events-none absolute -bottom-16 -left-16 w-48 h-48 rounded-full opacity-15 blur-3xl"
+              style={{ background: "radial-gradient(circle, #6366f1, transparent)" }} />
 
-            {/* ヘッダー */}
-            <div className="relative px-6 pt-6 pb-4 border-b border-white/10">
+            {/* Header */}
+            <div className="px-5 pt-5 pb-3 border-b border-white/10 flex-shrink-0">
               <div className="flex items-center justify-between">
                 <div className="flex items-center gap-3">
-                  <div className="w-10 h-10 rounded-2xl bg-indigo-500/30 flex items-center justify-center border border-indigo-400/30">
-                    <Volume2 className="w-5 h-5 text-indigo-300" />
+                  <div className="w-9 h-9 rounded-xl bg-indigo-500/25 border border-indigo-400/30 flex items-center justify-center">
+                    <Volume2 className="w-4 h-4 text-indigo-300" />
                   </div>
                   <div>
-                    <h2 className="text-white font-bold text-lg">
-                      音声で実践する
-                    </h2>
-                    <p className="text-indigo-300/70 text-xs">{chapterTitle}</p>
+                    <h2 className="text-white font-bold text-base leading-tight">音声で実践</h2>
+                    <p className="text-indigo-400/60 text-xs mt-0.5">{chapterTitle}</p>
                   </div>
                 </div>
-                <button
-                  onClick={handleClose}
-                  className="w-8 h-8 rounded-full bg-white/10 hover:bg-white/20 flex items-center justify-center text-white/60 hover:text-white transition-all"
-                  aria-label="閉じる"
-                >
-                  ✕
-                </button>
+                {/* Status pill */}
+                <div className="flex items-center gap-2">
+                  {isActive && (
+                    <span className="flex items-center gap-1.5 text-xs text-emerald-400 bg-emerald-400/10 border border-emerald-400/20 px-2.5 py-1 rounded-full">
+                      <span className="w-1.5 h-1.5 rounded-full bg-emerald-400 animate-pulse" />
+                      接続中
+                    </span>
+                  )}
+                  <button
+                    onClick={handleClose}
+                    className="w-7 h-7 rounded-full bg-white/10 hover:bg-white/20 flex items-center justify-center text-white/50 hover:text-white transition-all text-sm"
+                  >
+                    ✕
+                  </button>
+                </div>
               </div>
             </div>
 
-            {/* ボディ */}
-            <div className="relative px-6 py-5 flex flex-col gap-4">
-              {/* ビジュアライザー */}
-              <div className="flex items-center justify-center h-24">
-                {isActive && isAISpeaking ? (
-                  <div className="flex items-end gap-1 h-full">
-                    {[...Array(14)].map((_, i) => (
+            {/* Transcript area */}
+            <div className="flex-1 overflow-y-auto px-5 py-4 space-y-3 min-h-0"
+              style={{ minHeight: 200 }}>
+              {/* Initial hint when idle */}
+              {transcript.length === 0 && !liveAIText && !liveUserText && (
+                <div className="flex flex-col items-center justify-center h-full gap-3 py-8">
+                  {isActive ? (
+                    <>
                       <motion.div
-                        key={i}
-                        className="w-1.5 rounded-full"
-                        style={{
-                          background:
-                            "linear-gradient(to top, #818cf8, #c4b5fd)",
-                        }}
-                        animate={{
-                          height: [
-                            "6px",
-                            `${18 + Math.random() * 32}px`,
-                            "6px",
-                          ],
-                        }}
-                        transition={{
-                          duration: 0.4 + Math.random() * 0.5,
-                          repeat: Infinity,
-                          delay: i * 0.04,
-                          ease: "easeInOut",
-                        }}
-                      />
-                    ))}
-                  </div>
-                ) : isActive ? (
-                  <div className="flex flex-col items-center gap-2">
-                    <motion.div
-                      className="w-14 h-14 rounded-full flex items-center justify-center"
-                      style={{
-                        background: "rgba(99,102,241,0.2)",
-                        border: "2px solid rgba(99,102,241,0.4)",
-                      }}
-                      animate={{ scale: [1, 1.08, 1], opacity: [0.8, 1, 0.8] }}
-                      transition={{ duration: 2, repeat: Infinity }}
-                    >
-                      {isMuted ? (
-                        <MicOff className="w-6 h-6 text-red-400" />
-                      ) : (
-                        <Mic className="w-6 h-6 text-indigo-300" />
-                      )}
-                    </motion.div>
-                    <span className="text-indigo-300 text-sm">
-                      {isMuted ? "ミュート中" : "話しかけてください..."}
-                    </span>
-                  </div>
-                ) : isBusy ? (
-                  <div className="flex flex-col items-center gap-2">
-                    <Loader2 className="w-8 h-8 text-indigo-400 animate-spin" />
-                    <span className="text-indigo-300 text-sm">{busyLabel}</span>
-                  </div>
-                ) : status === "error" ? (
-                  <div className="flex flex-col items-center gap-2 text-center">
-                    <AlertCircle className="w-8 h-8 text-red-400" />
-                    <span className="text-red-300 text-sm max-w-xs leading-snug">
-                      {errorMsg}
-                    </span>
-                  </div>
-                ) : status === "stopped" ? (
-                  <div className="flex flex-col items-center gap-2">
-                    <div className="w-12 h-12 rounded-full bg-white/5 flex items-center justify-center">
-                      <PhoneOff className="w-5 h-5 text-slate-400" />
-                    </div>
-                    <span className="text-slate-400 text-sm">
-                      会話が終了しました
-                    </span>
-                  </div>
-                ) : (
-                  <div className="flex flex-col items-center gap-3">
-                    <div
-                      className="w-16 h-16 rounded-full flex items-center justify-center border-2 border-indigo-400/40"
-                      style={{ background: "rgba(99,102,241,0.12)" }}
-                    >
-                      <Mic className="w-8 h-8 text-indigo-400" />
-                    </div>
-                    <span className="text-indigo-300/60 text-sm">
-                      「会話を始める」でスタート
-                    </span>
-                  </div>
-                )}
-              </div>
-
-              {/* トランスクリプト */}
-              {transcript.length > 0 && (
-                <div
-                  className="max-h-48 overflow-y-auto space-y-2 rounded-2xl p-3"
-                  style={{ background: "rgba(0,0,0,0.28)" }}
-                >
-                  <div className="flex items-center gap-1.5 mb-2">
-                    <MessageSquare className="w-3.5 h-3.5 text-indigo-400" />
-                    <span className="text-indigo-400 text-xs font-medium">
-                      会話の記録
-                    </span>
-                  </div>
-                  {transcript.map((entry) => (
-                    <div
-                      key={entry.id}
-                      className={`flex ${
-                        entry.role === "user" ? "justify-end" : "justify-start"
-                      }`}
-                    >
-                      <div
-                        className={`max-w-[85%] px-3 py-2 rounded-2xl text-sm leading-relaxed ${
-                          entry.role === "user"
-                            ? "rounded-br-sm text-white"
-                            : "rounded-bl-sm text-indigo-100"
-                        }`}
-                        style={{
-                          background:
-                            entry.role === "user"
-                              ? "rgba(99,102,241,0.5)"
-                              : "rgba(255,255,255,0.08)",
-                        }}
+                        className="w-16 h-16 rounded-full flex items-center justify-center border-2 border-indigo-400/40"
+                        style={{ background: "rgba(99,102,241,0.12)" }}
+                        animate={{ scale: [1, 1.07, 1], opacity: [0.6, 1, 0.6] }}
+                        transition={{ duration: 2.5, repeat: Infinity }}
                       >
-                        {entry.text}
-                      </div>
+                        <Bot className="w-8 h-8 text-indigo-300" />
+                      </motion.div>
+                      <p className="text-indigo-300/70 text-sm text-center">
+                        AIが話し始めます…<br/>
+                        <span className="text-indigo-400/50 text-xs">字幕がここに表示されます</span>
+                      </p>
+                    </>
+                  ) : isBusy ? (
+                    <div className="flex flex-col items-center gap-3">
+                      <Loader2 className="w-9 h-9 text-indigo-400 animate-spin" />
+                      <p className="text-indigo-300/70 text-sm">
+                        {status === "fetching-token" ? "接続の準備中…" : "Geminiに接続中…"}
+                      </p>
                     </div>
-                  ))}
-                  <div ref={transcriptEndRef} />
+                  ) : status === "error" ? (
+                    <div className="flex flex-col items-center gap-2 text-center">
+                      <AlertCircle className="w-8 h-8 text-red-400" />
+                      <p className="text-red-300 text-sm max-w-xs">{errorMsg}</p>
+                    </div>
+                  ) : (
+                    <div className="flex flex-col items-center gap-3">
+                      <div className="w-16 h-16 rounded-full flex items-center justify-center border-2 border-indigo-400/30"
+                        style={{ background: "rgba(99,102,241,0.08)" }}>
+                        <Mic className="w-7 h-7 text-indigo-400/60" />
+                      </div>
+                      <p className="text-indigo-400/50 text-sm text-center">
+                        {status === "stopped" ? "会話が終了しました" : "「会話を始める」を押すとAIが話しかけます"}
+                      </p>
+                    </div>
+                  )}
                 </div>
               )}
 
-              {/* コントロール */}
-              <div className="flex items-center justify-center gap-4">
+              {/* Committed transcript */}
+              {transcript.map((entry) => (
+                <div key={entry.id} className={`flex items-start gap-2 ${entry.role === "user" ? "flex-row-reverse" : "flex-row"}`}>
+                  {/* Avatar */}
+                  <div className={`flex-shrink-0 w-7 h-7 rounded-full flex items-center justify-center border ${
+                    entry.role === "user"
+                      ? "bg-indigo-500/25 border-indigo-400/30"
+                      : "bg-violet-500/25 border-violet-400/30"
+                  }`}>
+                    {entry.role === "user"
+                      ? <User className="w-3.5 h-3.5 text-indigo-300" />
+                      : <Bot className="w-3.5 h-3.5 text-violet-300" />}
+                  </div>
+                  {/* Bubble */}
+                  <div className={`max-w-[80%] px-3.5 py-2.5 rounded-2xl text-sm leading-relaxed ${
+                    entry.role === "user"
+                      ? "rounded-tr-sm text-white"
+                      : "rounded-tl-sm text-indigo-50"
+                  }`}
+                    style={{
+                      background: entry.role === "user"
+                        ? "rgba(99,102,241,0.45)"
+                        : "rgba(255,255,255,0.08)",
+                    }}>
+                    {entry.text}
+                  </div>
+                </div>
+              ))}
+
+              {/* Live AI text (streaming) */}
+              {liveAIText && (
+                <div className="flex items-start gap-2 flex-row">
+                  <div className="flex-shrink-0 w-7 h-7 rounded-full flex items-center justify-center border bg-violet-500/25 border-violet-400/30">
+                    <Bot className="w-3.5 h-3.5 text-violet-300" />
+                  </div>
+                  <div className="max-w-[80%] px-3.5 py-2.5 rounded-2xl rounded-tl-sm text-sm leading-relaxed text-indigo-50"
+                    style={{ background: "rgba(255,255,255,0.08)" }}>
+                    {liveAIText}
+                    <motion.span
+                      className="inline-block ml-0.5 w-0.5 h-3.5 bg-indigo-400 align-middle rounded"
+                      animate={{ opacity: [1, 0, 1] }}
+                      transition={{ duration: 0.8, repeat: Infinity }}
+                    />
+                  </div>
+                </div>
+              )}
+
+              {/* Live User text (streaming) */}
+              {liveUserText && (
+                <div className="flex items-start gap-2 flex-row-reverse">
+                  <div className="flex-shrink-0 w-7 h-7 rounded-full flex items-center justify-center border bg-indigo-500/25 border-indigo-400/30">
+                    <User className="w-3.5 h-3.5 text-indigo-300" />
+                  </div>
+                  <div className="max-w-[80%] px-3.5 py-2.5 rounded-2xl rounded-tr-sm text-sm leading-relaxed text-white opacity-70"
+                    style={{ background: "rgba(99,102,241,0.35)" }}>
+                    {liveUserText}
+                  </div>
+                </div>
+              )}
+
+              <div ref={transcriptEndRef} />
+            </div>
+
+            {/* AI speaking wave */}
+            {isActive && isAISpeaking && (
+              <div className="flex-shrink-0 flex items-center justify-center gap-0.5 py-2 border-t border-white/5">
+                <span className="text-violet-400/60 text-xs mr-2">AI 話し中</span>
+                {[...Array(10)].map((_, i) => (
+                  <motion.div key={i} className="w-1 rounded-full bg-violet-400/70"
+                    animate={{ height: ["3px", `${8 + Math.random() * 14}px`, "3px"] }}
+                    transition={{ duration: 0.4 + Math.random() * 0.4, repeat: Infinity, delay: i * 0.06, ease: "easeInOut" }}
+                  />
+                ))}
+              </div>
+            )}
+
+            {/* Controls */}
+            <div className="flex-shrink-0 px-5 pb-6 pt-3 border-t border-white/10">
+              <div className="flex items-center justify-center gap-3">
                 {canStart ? (
                   <motion.button
-                    whileHover={{ scale: 1.05 }}
-                    whileTap={{ scale: 0.95 }}
+                    whileHover={{ scale: 1.04 }}
+                    whileTap={{ scale: 0.96 }}
                     onClick={startSession}
-                    className="flex items-center gap-2 px-8 py-3 rounded-full font-bold text-white shadow-lg"
+                    className="flex items-center gap-2 px-8 py-3 rounded-full font-bold text-white text-sm shadow-lg"
                     style={{
                       background: "linear-gradient(135deg, #6366f1, #8b5cf6)",
-                      boxShadow: "0 0 24px rgba(99,102,241,0.4)",
+                      boxShadow: "0 0 28px rgba(99,102,241,0.45)",
                     }}
                   >
-                    <Mic className="w-5 h-5" />
+                    <Mic className="w-4 h-4" />
                     {status === "error" ? "再接続する" : "会話を始める"}
                   </motion.button>
                 ) : isBusy ? (
-                  <button
-                    disabled
-                    className="flex items-center gap-2 px-8 py-3 rounded-full font-bold text-white/50 bg-white/10 cursor-not-allowed"
-                  >
-                    <Loader2 className="w-5 h-5 animate-spin" />
-                    準備中...
+                  <button disabled
+                    className="flex items-center gap-2 px-8 py-3 rounded-full font-bold text-white/40 bg-white/8 text-sm cursor-not-allowed">
+                    <Loader2 className="w-4 h-4 animate-spin" />準備中…
                   </button>
                 ) : (
                   <>
+                    {/* Mute */}
                     <motion.button
-                      whileHover={{ scale: 1.1 }}
-                      whileTap={{ scale: 0.9 }}
+                      whileHover={{ scale: 1.1 }} whileTap={{ scale: 0.9 }}
                       onClick={toggleMute}
                       title={isMuted ? "ミュート解除" : "ミュート"}
-                      className={`w-12 h-12 rounded-full flex items-center justify-center border transition-all ${
+                      className={`w-11 h-11 rounded-full flex items-center justify-center border transition-all ${
                         isMuted
                           ? "bg-red-500/20 border-red-500/50 text-red-400"
-                          : "bg-white/10 border-white/20 text-white hover:bg-white/20"
+                          : "bg-white/10 border-white/20 text-white/80 hover:bg-white/20"
                       }`}
                     >
-                      {isMuted ? (
-                        <MicOff className="w-5 h-5" />
-                      ) : (
-                        <Mic className="w-5 h-5" />
-                      )}
+                      {isMuted ? <MicOff className="w-4 h-4" /> : <Mic className="w-4 h-4" />}
                     </motion.button>
 
+                    {/* End */}
                     <motion.button
-                      whileHover={{ scale: 1.05 }}
-                      whileTap={{ scale: 0.95 }}
+                      whileHover={{ scale: 1.04 }} whileTap={{ scale: 0.96 }}
                       onClick={endSession}
-                      className="flex items-center gap-2 px-6 py-3 rounded-full font-bold text-white"
-                      style={{
-                        background:
-                          "linear-gradient(135deg, #ef4444, #dc2626)",
-                      }}
+                      className="flex items-center gap-2 px-6 py-3 rounded-full font-bold text-white text-sm"
+                      style={{ background: "linear-gradient(135deg, #ef4444, #dc2626)" }}
                     >
-                      <PhoneOff className="w-5 h-5" />
-                      終了する
+                      <PhoneOff className="w-4 h-4" />終了する
                     </motion.button>
                   </>
                 )}
               </div>
 
-              {/* セキュリティバッジ */}
-              <div className="flex items-center justify-center gap-1.5">
-                <div className="w-1.5 h-1.5 rounded-full bg-green-400 animate-pulse" />
-                <p className="text-center text-indigo-400/50 text-xs">
-                  セキュア接続 • この章で学んだフレーズを使って話してみよう
+              {/* Hint text */}
+              {isActive && !isMuted && (
+                <p className="text-center text-indigo-400/40 text-xs mt-3">
+                  AIが質問したら答えてみましょう。ゆっくり話して大丈夫です。
                 </p>
-              </div>
+              )}
+              {isActive && isMuted && (
+                <p className="text-center text-red-400/60 text-xs mt-3">
+                  マイクがオフです — 上のボタンで解除できます
+                </p>
+              )}
             </div>
           </motion.div>
         </motion.div>
