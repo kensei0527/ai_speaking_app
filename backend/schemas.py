@@ -180,6 +180,56 @@ class LessonCompleteResponse(BaseModel):
     results: List[LessonAnswerResult]
 
 
+# ─── Lesson History Schemas ───────────────────────────────────────────────────
+
+class LessonHistoryItem(BaseModel):
+    """レッスン履歴一覧の1件分"""
+    lesson_id: int
+    chapter_id: int
+    chapter_number: int
+    chapter_title: str
+    scenario_id: Optional[int] = None
+    scenario_title: Optional[str] = None
+    is_review: bool = False
+    total_questions: int
+    correct_count: int
+    accuracy_rate: float
+    average_score: float
+    completed_at: datetime
+
+
+class LessonDetailAnswer(BaseModel):
+    """レッスン詳細内の1問分の解答情報"""
+    order_index: int
+    japanese_text: str
+    expected_english: str
+    user_answer: str
+    is_correct: bool
+    score: float
+    evaluation_level: str
+    feedback_text: str
+    grammar_point: Optional[str] = None
+    alternative_expressions: List[str] = []
+    naturalness_tips: List[str] = []
+
+
+class LessonDetailResponse(BaseModel):
+    """レッスン詳細（全問題と解答を含む）"""
+    lesson_id: int
+    chapter_id: int
+    chapter_number: int
+    chapter_title: str
+    scenario_id: Optional[int] = None
+    scenario_title: Optional[str] = None
+    is_review: bool = False
+    total_questions: int
+    correct_count: int
+    accuracy_rate: float
+    average_score: float
+    completed_at: datetime
+    answers: List[LessonDetailAnswer]
+
+
 # API endpoint inputs
 class GenerateQuestionRequest(BaseModel):
     chapter_id: int  # Required: which chapter to generate from

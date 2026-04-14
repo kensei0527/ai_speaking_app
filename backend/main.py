@@ -742,6 +742,148 @@ def complete_lesson(
     )
 
 
+
+# ─── Lesson History ───────────────────────────────────────────────────────────
+
+@app.get("/api/lessons/history", response_model=list[schemas.LessonHistoryItem])
+def get_lesson_history(
+    limit: int = 50,
+    db: Session = Depends(database.get_db),
+    user: models.User = Depends(auth.get_current_user),
+):
+    """ユーザーの完了済みレッスン一覧を新着順で返す。"""
+    lessons = (
+        db.query(models.Lesson)
+        .filter(
+            models.Lesson.user_id == user.id,
+            models.Lesson.status == "completed",
+        )
+        .order_by(models.Lesson.completed_at.desc())
+        .limit(limit)
+        .all()
+    )
+
+    result = []
+    for lesson in lessons:
+        chapter = db.query(models.Chapter).filter(models.Chapter.id == lesson.chapter_id).first()
+        scenario = db.query(models.Scenario).filter(models.Scenario.id == lesson.scenario_id).first() if lesson.scenario_id else None
+
+        # 正解数・平均スコアを attempts から集計
+        attempts = db.query(models.Attempt).filter(models.Attempt.lesson_id == lesson.id).all()
+        correct_count = sum(1 for a in attempts if a.is_correct)
+        total = len(attempts) or lesson.total_questions
+        accuracy = round(correct_count / total * 100, 1) if total > 0 else 0.0
+        avg_score = round(sum(a.score for a in attempts if a.score) / len(attempts), 1) if attempts else 0.0
+
+        result.append(schemas.LessonHistoryItem(
+            lesson_id=lesson.id,
+            chapter_id=lesson.chapter_id,
+            chapter_number=chapter.number if chapter else 0,
+            chapter_title=chapter.title if chapter else "不明",
+            scenario_id=lesson.scenario_id,
+            scenario_title=scenario.title if scenario else None,
+            is_review=lesson.is_review,
+            total_questions=total,
+            correct_count=correct_count,
+            accuracy_rate=accuracy,
+            average_score=avg_score,
+            completed_at=lesson.completed_at,
+        ))
+
+    return result
+
+
+@app.get("/api/lessons/{lesson_id}/detail", response_model=schemas.LessonDetailResponse)
+def get_lesson_detail(
+    lesson_id: int,
+    db: Session = Depends(database.get_db),
+    user: models.User = Depends(auth.get_current_user),
+):
+    """指定レッスンの全問題・解答・AIフィードバックを返す。"""
+    lesson = db.query(models.Lesson).filter(
+        models.Lesson.id == lesson_id,
+        models.Lesson.user_id == user.id,
+    ).first()
+    if not lesson:
+        raise HTTPException(status_code=404, detail="Lesson not found")
+
+    chapter = db.query(models.Chapter).filter(models.Chapter.id == lesson.chapter_id).first()
+    scenario = db.query(models.Scenario).filter(models.Scenario.id == lesson.scenario_id).first() if lesson.scenario_id else None
+
+    # LessonQuestion で順序を保持しながら解答を取得
+    lqs = db.query(models.LessonQuestion).filter(
+        models.LessonQuestion.lesson_id == lesson.id
+    ).order_by(models.LessonQuestion.order_index).all()
+
+    # attempt を question_id でマップ
+    attempts_map: dict[int, models.Attempt] = {}
+    for a in db.query(models.Attempt).filter(models.Attempt.lesson_id == lesson.id).all():
+        attempts_map[a.question_id] = a
+
+    answers = []
+    correct_count = 0
+    score_sum = 0.0
+
+    for lq in lqs:
+        q = db.query(models.Question).filter(models.Question.id == lq.question_id).first()
+        if not q:
+            continue
+        a = attempts_map.get(q.id)
+        if not a:
+            continue
+
+        if a.is_correct:
+            correct_count += 1
+        score_sum += a.score or 0
+
+        alt_exprs: list[str] = []
+        nat_tips: list[str] = []
+        try:
+            if a.alternative_expressions:
+                alt_exprs = json.loads(a.alternative_expressions)
+        except Exception:
+            pass
+        try:
+            if a.naturalness_tips:
+                nat_tips = json.loads(a.naturalness_tips)
+        except Exception:
+            pass
+
+        answers.append(schemas.LessonDetailAnswer(
+            order_index=lq.order_index,
+            japanese_text=q.japanese_text,
+            expected_english=q.expected_english_text,
+            user_answer=a.user_answer,
+            is_correct=a.is_correct,
+            score=a.score or 0,
+            evaluation_level=a.ai_feedback.split("\\n")[0] if a.ai_feedback else "",
+            feedback_text=a.ai_feedback or "",
+            grammar_point=a.grammar_point,
+            alternative_expressions=alt_exprs,
+            naturalness_tips=nat_tips,
+        ))
+
+    total = len(answers)
+    accuracy = round(correct_count / total * 100, 1) if total > 0 else 0.0
+    avg_score = round(score_sum / total, 1) if total > 0 else 0.0
+
+    return schemas.LessonDetailResponse(
+        lesson_id=lesson.id,
+        chapter_id=lesson.chapter_id,
+        chapter_number=chapter.number if chapter else 0,
+        chapter_title=chapter.title if chapter else "不明",
+        scenario_id=lesson.scenario_id,
+        scenario_title=scenario.title if scenario else None,
+        is_review=lesson.is_review,
+        total_questions=total,
+        correct_count=correct_count,
+        accuracy_rate=accuracy,
+        average_score=avg_score,
+        completed_at=lesson.completed_at,
+        answers=answers,
+    )
+
+
 # ─── Legacy: Single Question Generation (kept for backward compat) ────────────
 
 @app.post("/api/questions/generate", response_model=schemas.QuestionResponse)

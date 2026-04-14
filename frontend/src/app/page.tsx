@@ -18,6 +18,7 @@ import {
   TrendingUp,
   Zap,
   BarChart2,
+  History,
 } from "lucide-react";
 import { motion } from "framer-motion";
 import { createClient } from "@/utils/supabase/client";
@@ -172,6 +173,12 @@ export default function Dashboard() {
           </h1>
         </div>
         <div className="flex items-center gap-2">
+          <Link href="/history">
+            <button className="flex items-center gap-2 text-slate-400 hover:text-indigo-500 transition-colors px-3 py-2 rounded-lg hover:bg-indigo-50 dark:hover:bg-indigo-950/30">
+              <History size={18} />
+              <span className="text-sm font-medium hidden sm:inline">履歴</span>
+            </button>
+          </Link>
           <Link href="/profile">
             <button className="flex items-center gap-2 text-slate-400 hover:text-indigo-500 transition-colors px-3 py-2 rounded-lg hover:bg-indigo-50 dark:hover:bg-indigo-950/30">
               <BarChart2 size={18} />

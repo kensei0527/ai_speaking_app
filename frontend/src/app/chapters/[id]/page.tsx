@@ -10,13 +10,12 @@ import {
   Brain,
   CheckCircle2,
   ChevronRight,
-  Clock,
+  History,
   Lock,
   Sparkles,
   Target,
   TrendingUp,
   AlertTriangle,
-  XCircle,
   Zap,
 } from "lucide-react";
 import { createClient } from "@/utils/supabase/client";
@@ -344,46 +343,31 @@ export default function ChapterDetailPage() {
           </motion.div>
         )}
 
-        {/* ── Recent Attempts ──────────────────────────────────── */}
-        {chapter.recent_attempts.length > 0 && (
-          <motion.div
-            initial={{ opacity: 0, y: 20 }}
-            animate={{ opacity: 1, y: 0 }}
-            transition={{ delay: 0.35 }}
-            className="glass-panel rounded-2xl p-5 sm:p-6 mb-8"
-          >
-            <div className="flex items-center gap-2 mb-4">
-              <Clock size={18} className="text-slate-500" />
-              <h3 className="font-bold text-slate-700 dark:text-slate-200">直近の解答履歴</h3>
+        {/* ── Lesson History Link ─────────────────────────────── */}
+        <motion.div
+          initial={{ opacity: 0, y: 20 }}
+          animate={{ opacity: 1, y: 0 }}
+          transition={{ delay: 0.35 }}
+          className="glass-panel rounded-2xl p-5 sm:p-6 mb-8"
+        >
+          <div className="flex flex-col sm:flex-row items-start sm:items-center justify-between gap-4">
+            <div>
+              <div className="flex items-center gap-2 mb-1">
+                <History size={18} className="text-indigo-500" />
+                <h3 className="font-bold text-slate-700 dark:text-slate-200">過去のレッスンを復習する</h3>
+              </div>
+              <p className="text-sm text-slate-500 dark:text-slate-400">
+                これまでの解答・AIフィードバックをいつでも振り返れます。
+              </p>
             </div>
-            <div className="space-y-3">
-              {chapter.recent_attempts.map((a, idx) => (
-                <div
-                  key={idx}
-                  className={`flex items-start gap-3 p-3 rounded-xl ${
-                    a.is_correct
-                      ? "bg-emerald-50 dark:bg-emerald-900/10"
-                      : "bg-rose-50 dark:bg-rose-900/10"
-                  }`}
-                >
-                  <div className={`mt-0.5 ${a.is_correct ? "text-emerald-500" : "text-rose-500"}`}>
-                    {a.is_correct ? <CheckCircle2 size={18} /> : <XCircle size={18} />}
-                  </div>
-                  <div className="flex-1 min-w-0">
-                    <p className="text-sm font-medium text-slate-700 dark:text-slate-200 break-words">{a.question_japanese}</p>
-                    <p className="text-xs text-slate-400 mt-0.5 truncate">回答: {a.user_answer}</p>
-                  </div>
-                  <div className="text-right flex-shrink-0">
-                    <p className={`text-sm font-bold ${a.is_correct ? "text-emerald-600 dark:text-emerald-400" : "text-rose-600 dark:text-rose-400"}`}>
-                      {a.score.toFixed(0)}点
-                    </p>
-                    <p className="text-xs text-slate-400">{a.grammar_point}</p>
-                  </div>
-                </div>
-              ))}
-            </div>
-          </motion.div>
-        )}
+            <Link href="/history" className="flex-shrink-0">
+              <button className="flex items-center gap-2 px-5 py-2.5 bg-gradient-to-r from-indigo-600 to-purple-600 hover:from-indigo-500 hover:to-purple-500 text-white text-sm font-bold rounded-full shadow-md hover:shadow-lg transition-all hover:-translate-y-0.5">
+                <ChevronRight size={16} />
+                履歴を見る
+              </button>
+            </Link>
+          </div>
+        </motion.div>
 
         {/* ── Live Conversation Button ─────────────────────────────────────── */}
         {chapter.status !== "locked" && (
