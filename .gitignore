@@ -21,3 +21,6 @@ frontend/.vercel/
 # IDE/Editors
 .vscode/
 .idea/
+
+# Local documentation
+docs/app-flow.md
