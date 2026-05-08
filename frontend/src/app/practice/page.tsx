@@ -1,13 +1,14 @@
 "use client";
 
-import { useState, useEffect, useRef, Suspense } from "react";
+import { useState, useEffect, useRef, Suspense, useCallback } from "react";
 import { useSearchParams } from "next/navigation";
 import Link from "next/link";
 import { motion, AnimatePresence } from "framer-motion";
 import {
   ArrowLeft,
   Send,
-  Loader2,
+  Mic,
+  MicOff,
   CheckCircle2,
   XCircle,
   Brain,
@@ -24,6 +25,7 @@ import {
   Star,
 } from "lucide-react";
 import { createClient } from "@/utils/supabase/client";
+import { useBrowserSpeechRecognition } from "@/hooks/useBrowserSpeechRecognition";
 
 const API_URL = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
 
@@ -42,7 +44,6 @@ interface ChapterInfo {
 interface LessonQuestion {
   id: number;
   japanese_text: string;
-  expected_english_text: string;
   grammar_point: string;
   difficulty: number;
   order_index: number;
@@ -81,6 +82,8 @@ interface LessonResult {
   next_chapter_unlocked: boolean;
   results: AnswerResult[];
 }
+
+type VoiceInputState = ReturnType<typeof useBrowserSpeechRecognition>;
 
 // ─── Sub-components ──────────────────────────────────────────────────────────
 
@@ -190,21 +193,26 @@ function PracticePhase({
   lesson,
   chapter,
   currentIndex,
+  answer,
+  onAnswerChange,
   onAnswerSubmitted,
+  voiceInput,
 }: {
   lesson: LessonData;
   chapter: ChapterInfo | null;
   currentIndex: number;
+  answer: string;
+  onAnswerChange: (answer: string) => void;
   onAnswerSubmitted: (questionId: number, answer: string) => void;
+  voiceInput: VoiceInputState;
 }) {
   const question = lesson.questions[currentIndex];
-  const [answer, setAnswer] = useState("");
   const inputRef = useRef<HTMLTextAreaElement>(null);
 
   useEffect(() => {
-    setAnswer("");
-    setTimeout(() => inputRef.current?.focus(), 100);
-  }, [currentIndex]);
+    const timeoutId = window.setTimeout(() => inputRef.current?.focus(), 100);
+    return () => window.clearTimeout(timeoutId);
+  }, []);
 
   const handleSubmit = () => {
     if (!answer.trim()) return;
@@ -218,7 +226,16 @@ function PracticePhase({
     }
   };
 
+  const handleVoiceToggle = () => {
+    if (voiceInput.listening) {
+      voiceInput.stop();
+    } else {
+      voiceInput.start();
+    }
+  };
+
   const progress = ((currentIndex) / lesson.total_questions) * 100;
+  const voiceButtonLabel = voiceInput.listening ? "聞き取り停止" : "音声で回答";
 
   return (
     <motion.div
@@ -263,14 +280,51 @@ function PracticePhase({
 
       {/* Input */}
       <div className="glass-panel p-5 sm:p-6 rounded-3xl shadow-lg focus-within:ring-2 focus-within:ring-indigo-500 transition-all">
+        <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3 mb-4">
+          <div className="flex items-center gap-3">
+            <button
+              type="button"
+              onClick={handleVoiceToggle}
+              disabled={!voiceInput.supported}
+              className={`w-14 h-14 rounded-full flex items-center justify-center shadow-lg transition-all active:scale-95 disabled:opacity-50 disabled:cursor-not-allowed ${
+                voiceInput.listening
+                  ? "bg-rose-500 text-white shadow-rose-500/25"
+                  : "bg-indigo-600 text-white shadow-indigo-500/25 hover:bg-indigo-500"
+              }`}
+              aria-label={voiceButtonLabel}
+              title={voiceButtonLabel}
+            >
+              {voiceInput.listening ? <MicOff className="w-6 h-6" /> : <Mic className="w-6 h-6" />}
+            </button>
+            <div>
+              <p className="text-sm font-bold text-slate-700 dark:text-slate-200">{voiceButtonLabel}</p>
+              <p className="text-xs text-slate-400">
+                {voiceInput.listening
+                  ? "聞き取り中..."
+                  : voiceInput.supported
+                  ? "待機中"
+                  : "音声入力は使えません"}
+              </p>
+            </div>
+          </div>
+          {voiceInput.error && (
+            <p className="text-xs font-medium text-rose-500 sm:text-right">{voiceInput.error}</p>
+          )}
+        </div>
+
         <textarea
           ref={inputRef}
           value={answer}
-          onChange={(e) => setAnswer(e.target.value)}
+          onChange={(e) => onAnswerChange(e.target.value)}
           onKeyDown={handleKeyDown}
-          placeholder="Type your English translation here..."
+          placeholder="英語で話すか入力してください..."
           className="w-full bg-transparent text-lg text-slate-800 dark:text-white placeholder:text-slate-400 outline-none resize-none min-h-[100px]"
         />
+        {voiceInput.interimTranscript && (
+          <div className="mt-3 rounded-2xl bg-indigo-50 dark:bg-indigo-950/40 px-4 py-3 text-sm text-indigo-700 dark:text-indigo-200 border border-indigo-100 dark:border-indigo-900/50">
+            {voiceInput.interimTranscript}
+          </div>
+        )}
         <div className="flex flex-col-reverse sm:flex-row sm:justify-between items-stretch sm:items-center mt-4 gap-3">
           <span className="text-xs text-slate-400 hidden sm:block">
             <kbd className="px-2 py-1 bg-slate-100 dark:bg-slate-700 rounded-md">Enter</kbd> で送信
@@ -599,18 +653,45 @@ function PracticeContent() {
   const [phase, setPhase] = useState<Phase>("loading");
   const [currentIndex, setCurrentIndex] = useState(0);
   const [answers, setAnswers] = useState<{ question_id: number; user_answer: string }[]>([]);
+  const [currentAnswer, setCurrentAnswer] = useState("");
   const [lessonResult, setLessonResult] = useState<LessonResult | null>(null);
 
-  const supabase = createClient();
+  const appendVoiceTranscript = useCallback((text: string) => {
+    const cleanedText = text.trim();
+    if (!cleanedText) return;
 
-  const getSession = async () => {
+    setCurrentAnswer((existingAnswer) => {
+      const trimmedAnswer = existingAnswer.trimEnd();
+      return trimmedAnswer ? `${trimmedAnswer} ${cleanedText}` : cleanedText;
+    });
+  }, []);
+
+  const voiceInput = useBrowserSpeechRecognition({
+    lang: "en-US",
+    onFinalTranscript: appendVoiceTranscript,
+  });
+  const { resetInterim: resetVoiceInterim, stop: stopVoiceInput } = voiceInput;
+
+  const getSession = useCallback(async () => {
+    const supabase = createClient();
     const { data: { session } } = await supabase.auth.getSession();
     if (!session) {
       window.location.href = "/login";
       return null;
     }
     return session;
-  };
+  }, []);
+
+  useEffect(() => {
+    setCurrentAnswer("");
+    resetVoiceInterim();
+  }, [currentIndex, lesson?.lesson_id, resetVoiceInterim]);
+
+  useEffect(() => {
+    if (phase !== "practicing") {
+      stopVoiceInput();
+    }
+  }, [phase, stopVoiceInput]);
 
   // Load chapter info
   useEffect(() => {
@@ -629,7 +710,7 @@ function PracticeContent() {
       }
     };
     fetchChapter();
-  }, [chapterId]);
+  }, [chapterId, getSession]);
 
   // Start lesson
   useEffect(() => {
@@ -682,7 +763,7 @@ function PracticeContent() {
       }
     };
     startLesson();
-  }, [chapterId, searchParams, lesson]);
+  }, [chapterId, searchParams, lesson, getSession]);
 
   const handleAnswerSubmitted = (questionId: number, userAnswer: string) => {
     const newAnswers = [...answers, { question_id: questionId, user_answer: userAnswer }];
@@ -762,11 +843,14 @@ function PracticeContent() {
 
           {phase === "practicing" && lesson && (
             <PracticePhase
-              key="practicing"
+              key={`practicing-${currentIndex}`}
               lesson={lesson}
               chapter={chapter}
               currentIndex={currentIndex}
+              answer={currentAnswer}
+              onAnswerChange={setCurrentAnswer}
               onAnswerSubmitted={handleAnswerSubmitted}
+              voiceInput={voiceInput}
             />
           )}
 
@@ -790,6 +874,7 @@ function PracticeContent() {
                 setLesson(null);
                 setAnswers([]);
                 setCurrentIndex(0);
+                setCurrentAnswer("");
                 setLessonResult(null);
                 setPhase("loading");
               }}

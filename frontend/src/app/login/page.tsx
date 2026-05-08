@@ -6,7 +6,7 @@ import { createClient } from '@/utils/supabase/client'
 import { useRouter } from 'next/navigation'
 import Link from 'next/link'
 import Image from 'next/image'
-import { Sparkles, ArrowRight, Mail, Lock, Loader2 } from 'lucide-react'
+import { ArrowRight, Mail, Lock, Loader2 } from 'lucide-react'
 
 export default function LoginPage() {
   const [email, setEmail] = useState('')
@@ -124,7 +124,7 @@ export default function LoginPage() {
           </form>
 
           <div className="mt-8 text-center text-sm">
-            <span className="text-gray-400">Don't have an account? </span>
+            <span className="text-gray-400">Don&apos;t have an account? </span>
             <Link href="/register" className="font-medium text-blue-400 hover:text-blue-300 transition-colors">
               Sign up now
             </Link>

@@ -96,10 +96,10 @@ const levelConfig: Record<string, { emoji: string; gradient: string; label: stri
 export default function Dashboard() {
   const [stats, setStats] = useState<UserStats | null>(null);
   const [loading, setLoading] = useState(true);
-  const supabase = createClient();
 
   useEffect(() => {
     const fetchStats = async () => {
+      const supabase = createClient();
       const {
         data: { session },
       } = await supabase.auth.getSession();
@@ -127,6 +127,7 @@ export default function Dashboard() {
   }, []);
 
   const handleLogout = async () => {
+    const supabase = createClient();
     await supabase.auth.signOut();
     window.location.href = "/login";
   };

@@ -79,10 +79,9 @@ export default function ChapterDetailPage() {
   const [chapter, setChapter] = useState<ChapterDetail | null>(null);
   const [loading, setLoading] = useState(true);
   const [showLiveConversation, setShowLiveConversation] = useState(false);
-  const supabase = createClient();
-
   useEffect(() => {
     const fetchChapter = async () => {
+      const supabase = createClient();
       const {
         data: { session },
       } = await supabase.auth.getSession();
@@ -269,8 +268,7 @@ export default function ChapterDetailPage() {
           <p className="text-sm text-slate-500 mb-6">この章には様々な場面が用意されています。すべての場面をマスターして次の章に進みましょう。</p>
           
           <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
-            {chapter.scenarios && chapter.scenarios.map((sc, index) => {
-              const scStatus = statusLabels[sc.status] || statusLabels.locked;
+            {chapter.scenarios && chapter.scenarios.map((sc) => {
               const isLocked = sc.status === "locked";
               return (
                 <div key={sc.id} className={`glass-panel p-5 rounded-2xl flex flex-col ${isLocked ? 'opacity-60' : ''}`}>

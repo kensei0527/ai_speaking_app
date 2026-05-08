@@ -6,7 +6,7 @@ import { createClient } from '@/utils/supabase/client'
 import { useRouter } from 'next/navigation'
 import Link from 'next/link'
 import Image from 'next/image'
-import { UserPlus, ArrowRight, Mail, Lock, Loader2, User } from 'lucide-react'
+import { ArrowRight, Mail, Lock, Loader2, User } from 'lucide-react'
 
 const API_URL = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
 

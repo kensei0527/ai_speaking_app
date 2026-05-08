@@ -10,7 +10,6 @@ import {
   Volume2,
   Loader2,
   Bot,
-  User,
   Star,
   Zap,
   CheckCircle,
@@ -18,9 +17,9 @@ import {
 
 const API_URL = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
 
-const LIVE_WSS_BASE =
+const DEFAULT_LIVE_WS_URL =
   "wss://generativelanguage.googleapis.com/ws/" +
-  "google.ai.generativelanguage.v1alpha.GenerativeService.BidiGenerateContentConstrained";
+  "google.ai.generativelanguage.v1alpha.GenerativeService.BidiGenerateContent";
 
 // ── AudioWorklet processor (inline blob) ────────────────────────────────────
 const WORKLET_CODE = `
@@ -367,7 +366,11 @@ ${styleGuide}
       };
       micSrc.connect(worklet);
 
-      const ws = new WebSocket(`${LIVE_WSS_BASE}?access_token=${token}`);
+      const wsUrl =
+        typeof data.ws_url === "string" && data.ws_url
+          ? data.ws_url
+          : `${DEFAULT_LIVE_WS_URL}?access_token=${token}`;
+      const ws = new WebSocket(wsUrl);
       wsRef.current = ws;
 
       ws.onmessage = (event) => {
@@ -401,7 +404,7 @@ ${styleGuide}
         cleanup();
       };
 
-      ws.onclose = (e) => {
+      ws.onclose = () => {
         // Handled via endSession directly
       };
     } catch (err: unknown) {
@@ -409,7 +412,7 @@ ${styleGuide}
       setStatus("error");
       cleanup();
     }
-  }, [chapterId, chapterTitle, enqueueAudio, cleanup, handleMessage]);
+  }, [chapterId, chapterTitle, cleanup, handleMessage]);
 
   const endSessionAndEvaluate = useCallback(async () => {
     cleanup();
@@ -606,8 +609,10 @@ ${styleGuide}
                     {!isActive && !isBusy && (
                       <>
                         <Mic className="w-12 h-12 text-indigo-300" />
-                        <p className="text-indigo-200 text-sm italic">
-                          {status === "error" ? "エラーが発生しました" : "「会話を始める」を押してスタート"}
+                        <p className="text-indigo-200 text-sm italic text-center">
+                          {status === "error"
+                            ? errorMsg || "エラーが発生しました"
+                            : "「会話を始める」を押してスタート"}
                         </p>
                       </>
                     )}

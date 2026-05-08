@@ -493,7 +493,6 @@ def start_lesson(
         question_infos.append(schemas.LessonQuestionInfo(
             id=q.id,
             japanese_text=q.japanese_text,
-            expected_english_text=q.expected_english_text,
             grammar_point=q.grammar_point,
             difficulty=q.difficulty,
             order_index=lq.order_index,
@@ -575,7 +574,6 @@ def review_lesson(
         question_infos.append(schemas.LessonQuestionInfo(
             id=q.id,
             japanese_text=q.japanese_text,
-            expected_english_text=q.expected_english_text,
             grammar_point=q.grammar_point,
             difficulty=q.difficulty,
             order_index=lq.order_index,
@@ -611,28 +609,50 @@ def complete_lesson(
     if lesson.status == "completed":
         raise HTTPException(status_code=400, detail="Lesson already completed")
 
-    # Build a map of question_id -> LessonQuestion for order_index lookup
-    lq_map = {lq.question_id: lq for lq in lesson.questions}
+    # Validate the submitted answer set before calling AI or mutating progress.
+    lesson_questions = sorted(lesson.questions, key=lambda lq: lq.order_index)
+    expected_question_ids = [lq.question_id for lq in lesson_questions]
+    expected_id_set = set(expected_question_ids)
+    submitted_question_ids = [answer.question_id for answer in req.answers]
+    submitted_id_set = set(submitted_question_ids)
+
+    if len(submitted_question_ids) != len(submitted_id_set):
+        raise HTTPException(status_code=400, detail="Duplicate answers are not allowed")
+
+    missing_ids = expected_id_set - submitted_id_set
+    extra_ids = submitted_id_set - expected_id_set
+    if missing_ids or extra_ids:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "message": "Answers must exactly match the questions in this lesson",
+                "missing_question_ids": sorted(missing_ids),
+                "unexpected_question_ids": sorted(extra_ids),
+            },
+        )
+
+    answers_by_question_id = {}
+    for answer in req.answers:
+        user_answer = answer.user_answer.strip()
+        if not user_answer:
+            raise HTTPException(status_code=400, detail="Answers cannot be blank")
+        answers_by_question_id[answer.question_id] = user_answer
 
     results = []
     correct_count = 0
     total_score = 0.0
 
-    for answer_item in req.answers:
-        question = db.query(models.Question).filter(
-            models.Question.id == answer_item.question_id
-        ).first()
+    for lq in lesson_questions:
+        question = lq.question
         if not question:
-            continue
-
-        lq = lq_map.get(answer_item.question_id)
-        order_index = lq.order_index if lq else 0
+            raise HTTPException(status_code=500, detail="Lesson has missing question data")
+        user_answer = answers_by_question_id[question.id]
 
         # Evaluate with AI
         eval_result = ai_service.evaluate_answer(
             japanese=question.japanese_text,
             expected_english=question.expected_english_text,
-            user_answer=answer_item.user_answer,
+            user_answer=user_answer,
             grammar_point=question.grammar_point,
         )
 
@@ -641,7 +661,7 @@ def complete_lesson(
             user_id=user.id,
             question_id=question.id,
             lesson_id=lesson.id,
-            user_answer=answer_item.user_answer,
+            user_answer=user_answer,
             is_correct=eval_result.is_correct,
             ai_feedback=eval_result.feedback_text,
             alternative_expressions=json.dumps(eval_result.alternative_expressions, ensure_ascii=False),
@@ -693,9 +713,9 @@ def complete_lesson(
 
         results.append(schemas.LessonAnswerResult(
             question_id=question.id,
-            order_index=order_index,
+            order_index=lq.order_index,
             japanese_text=question.japanese_text,
-            user_answer=answer_item.user_answer,
+            user_answer=user_answer,
             is_correct=eval_result.is_correct,
             score=eval_result.score,
             evaluation_level=eval_result.evaluation_level,
@@ -1494,4 +1514,3 @@ async def evaluate_conversation_endpoint(
 
 if __name__ == "__main__":
     uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
-

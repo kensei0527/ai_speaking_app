@@ -15,7 +15,7 @@ load_dotenv()
 
 SUPABASE_URL = os.getenv("SUPABASE_URL", "https://tazaoowzpumqjkhlfpmg.supabase.co")
 SUPABASE_JWKS_URL = f"{SUPABASE_URL}/auth/v1/.well-known/jwks.json"
-# Legacy HS256 secret kept as fallback
+# Legacy HS256 secret is supported only when explicitly configured.
 SUPABASE_JWT_SECRET = os.getenv("SUPABASE_JWT_SECRET", "")
 
 security = HTTPBearer()
@@ -29,6 +29,7 @@ def _get_jwks() -> dict:
     if _jwks_cache is None:
         try:
             response = httpx.get(SUPABASE_JWKS_URL, timeout=5.0)
+            response.raise_for_status()
             _jwks_cache = response.json()
         except Exception as e:
             logging.error(f"Failed to fetch JWKS: {e}")
@@ -36,41 +37,52 @@ def _get_jwks() -> dict:
     return _jwks_cache
 
 
-def verify_token(credentials: HTTPAuthorizationCredentials = Depends(security)) -> dict:
-    """Verify the Supabase JWT using JWKS (ES256/RS256) or HS256 fallback."""
-    token = credentials.credentials
-    try:
-        header = jwt.get_unverified_header(token)
-        alg = header.get("alg", "")
+def _decode_supabase_jwt(token: str) -> dict:
+    """Decode a Supabase JWT and reject unsupported or unconfigured algorithms."""
+    global _jwks_cache
 
-        if alg in ("RS256", "ES256"):
-            # New asymmetric signing key approach - use JWKS
-            kid = header.get("kid")
+    header = jwt.get_unverified_header(token)
+    alg = header.get("alg", "")
+
+    if alg in ("RS256", "ES256"):
+        kid = header.get("kid")
+        if not kid:
+            raise JWTError("Missing key id in token header")
+
+        jwks = _get_jwks()
+        key_data = next((k for k in jwks.get("keys", []) if k.get("kid") == kid), None)
+        if not key_data:
+            _jwks_cache = None
             jwks = _get_jwks()
             key_data = next((k for k in jwks.get("keys", []) if k.get("kid") == kid), None)
-            if not key_data:
-                # Refresh cache and try once more
-                global _jwks_cache
-                _jwks_cache = None
-                jwks = _get_jwks()
-                key_data = next((k for k in jwks.get("keys", []) if k.get("kid") == kid), None)
-            if not key_data:
-                raise JWTError("Signing key not found in JWKS")
-            payload = jwt.decode(
-                token,
-                key_data,
-                algorithms=[alg],   # use the actual alg from the token header
-                options={"verify_aud": False}
-            )
-        else:
-            # Legacy HS256 approach
-            payload = jwt.decode(
-                token,
-                SUPABASE_JWT_SECRET,
-                algorithms=["HS256"],
-                options={"verify_aud": False}
-            )
-        return payload
+        if not key_data:
+            raise JWTError("Signing key not found in JWKS")
+
+        return jwt.decode(
+            token,
+            key_data,
+            algorithms=[alg],
+            options={"verify_aud": False},
+        )
+
+    if alg == "HS256":
+        if not SUPABASE_JWT_SECRET:
+            raise JWTError("HS256 token received but SUPABASE_JWT_SECRET is not configured")
+        return jwt.decode(
+            token,
+            SUPABASE_JWT_SECRET,
+            algorithms=["HS256"],
+            options={"verify_aud": False},
+        )
+
+    raise JWTError(f"Unsupported JWT signing algorithm: {alg or 'missing'}")
+
+
+def verify_token(credentials: HTTPAuthorizationCredentials = Depends(security)) -> dict:
+    """Verify the Supabase JWT using JWKS or an explicitly configured HS256 secret."""
+    token = credentials.credentials
+    try:
+        return _decode_supabase_jwt(token)
 
     except JWTError as e:
         logging.error(f"JWT Verification failed: {e}")
@@ -87,25 +99,7 @@ def verify_token_raw(token: str, db: Session) -> Optional[models.User]:
     失敗時は None を返す（HTTPException は raise しない）。
     """
     try:
-        header = jwt.get_unverified_header(token)
-        alg = header.get("alg", "")
-
-        if alg in ("RS256", "ES256"):
-            kid = header.get("kid")
-            jwks = _get_jwks()
-            key_data = next((k for k in jwks.get("keys", []) if k.get("kid") == kid), None)
-            if not key_data:
-                global _jwks_cache
-                _jwks_cache = None
-                jwks = _get_jwks()
-                key_data = next((k for k in jwks.get("keys", []) if k.get("kid") == kid), None)
-            if not key_data:
-                return None
-            payload = jwt.decode(token, key_data, algorithms=[alg], options={"verify_aud": False})
-        else:
-            payload = jwt.decode(
-                token, SUPABASE_JWT_SECRET, algorithms=["HS256"], options={"verify_aud": False}
-            )
+        payload = _decode_supabase_jwt(token)
 
         user_id: str = payload.get("sub")
         email: str = payload.get("email", "")

@@ -120,7 +120,6 @@ class LessonStartRequest(BaseModel):
 class LessonQuestionInfo(BaseModel):
     id: int
     japanese_text: str
-    expected_english_text: str
     grammar_point: str
     difficulty: int
     order_index: int

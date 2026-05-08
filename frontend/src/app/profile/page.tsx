@@ -2,12 +2,11 @@
 
 import { useEffect, useState } from "react";
 import Link from "next/link";
-import { motion, AnimatePresence } from "framer-motion";
+import { motion } from "framer-motion";
 import {
   ArrowLeft,
   Brain,
   BarChart2,
-  Target,
   TrendingUp,
   TrendingDown,
   BookOpen,
@@ -117,10 +116,10 @@ function ChapterScoreBar({ chapter }: { chapter: ChapterScore }) {
 export default function ProfilePage() {
   const [report, setReport] = useState<SkillReport | null>(null);
   const [loading, setLoading] = useState(true);
-  const supabase = createClient();
 
   useEffect(() => {
     const fetchReport = async () => {
+      const supabase = createClient();
       const {
         data: { session },
       } = await supabase.auth.getSession();
