@@ -533,7 +533,10 @@ def review_lesson(
     
     if req.mode == "weak":
         # Find which questions the user got poorly on in the previous lesson
-        attempts = db.query(models.Attempt).filter(models.Attempt.lesson_id == old_lesson.id).all()
+        attempts = db.query(models.Attempt).filter(
+            models.Attempt.lesson_id == old_lesson.id,
+            models.Attempt.user_id == user.id,
+        ).all()
         weak_q_ids = [a.question_id for a in attempts if a.score < 60]
         q_ids_to_review = weak_q_ids
     else:
@@ -789,7 +792,10 @@ def get_lesson_history(
         scenario = db.query(models.Scenario).filter(models.Scenario.id == lesson.scenario_id).first() if lesson.scenario_id else None
 
         # 正解数・平均スコアを attempts から集計
-        attempts = db.query(models.Attempt).filter(models.Attempt.lesson_id == lesson.id).all()
+        attempts = db.query(models.Attempt).filter(
+            models.Attempt.lesson_id == lesson.id,
+            models.Attempt.user_id == user.id,
+        ).all()
         correct_count = sum(1 for a in attempts if a.is_correct)
         total = len(attempts) or lesson.total_questions
         accuracy = round(correct_count / total * 100, 1) if total > 0 else 0.0
@@ -837,7 +843,10 @@ def get_lesson_detail(
 
     # attempt を question_id でマップ
     attempts_map: dict[int, models.Attempt] = {}
-    for a in db.query(models.Attempt).filter(models.Attempt.lesson_id == lesson.id).all():
+    for a in db.query(models.Attempt).filter(
+        models.Attempt.lesson_id == lesson.id,
+        models.Attempt.user_id == user.id,
+    ).all():
         attempts_map[a.question_id] = a
 
     answers = []
@@ -986,6 +995,21 @@ def evaluate_answer(
 
     if not question:
         raise HTTPException(status_code=404, detail="Question not found")
+
+    if submit.lesson_id is not None:
+        lesson = db.query(models.Lesson).filter(
+            models.Lesson.id == submit.lesson_id,
+            models.Lesson.user_id == user.id,
+        ).first()
+        if not lesson:
+            raise HTTPException(status_code=404, detail="Lesson not found")
+
+        lesson_question = db.query(models.LessonQuestion).filter(
+            models.LessonQuestion.lesson_id == lesson.id,
+            models.LessonQuestion.question_id == question.id,
+        ).first()
+        if not lesson_question:
+            raise HTTPException(status_code=400, detail="Question does not belong to this lesson")
 
     eval_result = ai_service.evaluate_answer(
         japanese=question.japanese_text,
