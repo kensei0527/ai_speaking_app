@@ -21,6 +21,14 @@ const DEFAULT_LIVE_WS_URL =
   "wss://generativelanguage.googleapis.com/ws/" +
   "google.ai.generativelanguage.v1alpha.GenerativeService.BidiGenerateContent";
 
+const LIVE_AUDIO_SAMPLE_RATE = 16000;
+const VAD_RMS_THRESHOLD = 0.012;
+const VAD_PREROLL_MS = 250;
+const VAD_HANGOVER_MS = 700;
+const SESSION_IDLE_TIMEOUT_MS = 60_000;
+const SESSION_MAX_DURATION_MS = 5 * 60_000;
+const AUTO_STOP_CHECK_INTERVAL_MS = 1000;
+
 // ── AudioWorklet processor (inline blob) ────────────────────────────────────
 const WORKLET_CODE = `
 class PCM16Processor extends AudioWorkletProcessor {
@@ -61,6 +69,22 @@ function base64ToArrayBuffer(b64: string): ArrayBuffer {
   const bytes = new Uint8Array(bin.length);
   for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
   return bytes.buffer as ArrayBuffer;
+}
+
+function getPcm16DurationMs(buf: ArrayBuffer): number {
+  return (new Int16Array(buf).length / LIVE_AUDIO_SAMPLE_RATE) * 1000;
+}
+
+function getPcm16Rms(buf: ArrayBuffer): number {
+  const samples = new Int16Array(buf);
+  if (samples.length === 0) return 0;
+
+  let sumSquares = 0;
+  for (let i = 0; i < samples.length; i += 1) {
+    const sample = samples[i] / 32768;
+    sumSquares += sample * sample;
+  }
+  return Math.sqrt(sumSquares / samples.length);
 }
 
 // ── Types ────────────────────────────────────────────────────────────────────
@@ -110,7 +134,20 @@ export default function LiveConversationModal({
   const audioQueueRef = useRef<Float32Array<ArrayBuffer>[]>([]);
   const isPlayingRef = useRef(false);
   const isMutedRef = useRef(false);
+  const isLiveReadyRef = useRef(false);
+  const isEndingRef = useRef(false);
   const entryIdRef = useRef(0);
+  const transcriptRef = useRef<TranscriptEntry[]>([]);
+
+  // VAD / session timeout refs
+  const vadPrerollRef = useRef<ArrayBuffer[]>([]);
+  const vadPrerollDurationMsRef = useRef(0);
+  const vadIsSpeakingRef = useRef(false);
+  const vadLastSpeechAtRef = useRef(0);
+  const autoStopIntervalRef = useRef<number | null>(null);
+  const sessionStartedAtRef = useRef<number | null>(null);
+  const lastActivityAtRef = useRef<number | null>(null);
+  const endSessionAndEvaluateRef = useRef<(() => Promise<void>) | null>(null);
 
   // Live transcription accumulator refs
   const liveAIRef = useRef("");
@@ -130,18 +167,70 @@ export default function LiveConversationModal({
 
   const transcriptEndRef = useRef<HTMLDivElement | null>(null);
 
+  const appendTranscriptEntry = useCallback((entry: Omit<TranscriptEntry, "id">) => {
+    const nextEntry = { ...entry, id: entryIdRef.current++ };
+    const next = [...transcriptRef.current, nextEntry];
+    transcriptRef.current = next;
+    setTranscript(next);
+    return nextEntry;
+  }, []);
+
+  const resetVadState = useCallback(() => {
+    vadPrerollRef.current = [];
+    vadPrerollDurationMsRef.current = 0;
+    vadIsSpeakingRef.current = false;
+    vadLastSpeechAtRef.current = 0;
+  }, []);
+
+  const markSessionActivity = useCallback(() => {
+    lastActivityAtRef.current = Date.now();
+  }, []);
+
+  const clearAutoStopTimers = useCallback(() => {
+    if (autoStopIntervalRef.current !== null) {
+      window.clearInterval(autoStopIntervalRef.current);
+      autoStopIntervalRef.current = null;
+    }
+    sessionStartedAtRef.current = null;
+    lastActivityAtRef.current = null;
+  }, []);
+
+  const startAutoStopTimers = useCallback(() => {
+    clearAutoStopTimers();
+    const now = Date.now();
+    sessionStartedAtRef.current = now;
+    lastActivityAtRef.current = now;
+
+    autoStopIntervalRef.current = window.setInterval(() => {
+      if (!isLiveReadyRef.current || isEndingRef.current) return;
+
+      const currentTime = Date.now();
+      const sessionStartedAt = sessionStartedAtRef.current ?? currentTime;
+      const lastActivityAt = lastActivityAtRef.current ?? sessionStartedAt;
+
+      if (currentTime - sessionStartedAt >= SESSION_MAX_DURATION_MS) {
+        void endSessionAndEvaluateRef.current?.();
+        return;
+      }
+
+      if (
+        !isPlayingRef.current &&
+        currentTime - lastActivityAt >= SESSION_IDLE_TIMEOUT_MS
+      ) {
+        void endSessionAndEvaluateRef.current?.();
+      }
+    }, AUTO_STOP_CHECK_INTERVAL_MS);
+  }, [clearAutoStopTimers]);
+
   // ── User speech bubble commit utility ────────────────────────────────────
   const commitUserSpeech = useCallback(() => {
     const text = liveUserRef.current.trim();
     if (text) {
-      setTranscript((p) => [
-        ...p,
-        { role: "user", text, id: entryIdRef.current++ },
-      ]);
+      appendTranscriptEntry({ role: "user", text });
       // Reset ref only, we don't display user text in UI anymore
       liveUserRef.current = "";
     }
-  }, []);
+  }, [appendTranscriptEntry]);
 
   // ── Audio playback queue ────────────────────────────────────────────────
   const playNextChunk = useCallback(() => {
@@ -171,14 +260,86 @@ export default function LiveConversationModal({
 
   const enqueueAudio = useCallback(
     (base64: string) => {
+      markSessionActivity();
       audioQueueRef.current.push(pcm16ToFloat32(base64ToArrayBuffer(base64)));
       if (!isPlayingRef.current) playNextChunk();
     },
-    [playNextChunk]
+    [markSessionActivity, playNextChunk]
+  );
+
+  const sendAudioFrame = useCallback((buf: ArrayBuffer) => {
+    if (wsRef.current?.readyState !== WebSocket.OPEN) return;
+
+    wsRef.current.send(
+      JSON.stringify({
+        realtimeInput: {
+          audio: { data: arrayBufferToBase64(buf), mimeType: "audio/pcm" },
+        },
+      })
+    );
+  }, []);
+
+  const processMicFrame = useCallback(
+    (buf: ArrayBuffer) => {
+      if (wsRef.current?.readyState !== WebSocket.OPEN || !isLiveReadyRef.current) {
+        return;
+      }
+
+      if (isMutedRef.current) {
+        resetVadState();
+        return;
+      }
+
+      const now = performance.now();
+      const isSpeech = getPcm16Rms(buf) >= VAD_RMS_THRESHOLD;
+
+      if (isSpeech) {
+        markSessionActivity();
+        vadLastSpeechAtRef.current = now;
+
+        if (!vadIsSpeakingRef.current) {
+          vadIsSpeakingRef.current = true;
+          for (const prerollFrame of vadPrerollRef.current) {
+            sendAudioFrame(prerollFrame);
+          }
+          vadPrerollRef.current = [];
+          vadPrerollDurationMsRef.current = 0;
+        }
+
+        sendAudioFrame(buf);
+        return;
+      }
+
+      if (vadIsSpeakingRef.current) {
+        if (now - vadLastSpeechAtRef.current <= VAD_HANGOVER_MS) {
+          sendAudioFrame(buf);
+          return;
+        }
+
+        vadIsSpeakingRef.current = false;
+      }
+
+      vadPrerollRef.current.push(buf);
+      vadPrerollDurationMsRef.current += getPcm16DurationMs(buf);
+      while (
+        vadPrerollDurationMsRef.current > VAD_PREROLL_MS &&
+        vadPrerollRef.current.length > 0
+      ) {
+        const dropped = vadPrerollRef.current.shift();
+        if (dropped) {
+          vadPrerollDurationMsRef.current -= getPcm16DurationMs(dropped);
+        }
+      }
+    },
+    [markSessionActivity, resetVadState, sendAudioFrame]
   );
 
   // ── Cleanup ─────────────────────────────────────────────────────────────
   const cleanup = useCallback(() => {
+    clearAutoStopTimers();
+    isLiveReadyRef.current = false;
+    resetVadState();
+
     workletNodeRef.current?.disconnect();
     workletNodeRef.current = null;
     mediaStreamRef.current?.getTracks().forEach((t) => t.stop());
@@ -198,7 +359,7 @@ export default function LiveConversationModal({
     liveUserRef.current = "";
     setIsAISpeaking(false);
     setLiveAIText("");
-  }, []);
+  }, [clearAutoStopTimers, resetVadState]);
 
   // ── Message handler ─────────────────────────────────────────────────────
   const handleMessage = useCallback(
@@ -212,6 +373,9 @@ export default function LiveConversationModal({
 
       // Setup complete
       if (msg.setupComplete) {
+        isLiveReadyRef.current = true;
+        resetVadState();
+        startAutoStopTimers();
         setStatus("connected");
         const initMsg = {
           realtimeInput: { text: "(The student is ready. Please begin.)" },
@@ -233,6 +397,7 @@ export default function LiveConversationModal({
       // AI transcription
       const outTx = sc.outputTranscription as { text?: string; finished?: boolean } | undefined;
       if (outTx?.text) {
+        markSessionActivity();
         liveAIRef.current += outTx.text;
         setLiveAIText(liveAIRef.current);
       }
@@ -240,6 +405,7 @@ export default function LiveConversationModal({
       // User transcription from Gemini (accumulated silently for evaluation)
       const inTx = sc.inputTranscription as { text?: string; finished?: boolean } | undefined;
       if (inTx?.text) {
+        markSessionActivity();
         liveUserRef.current += inTx.text;
       }
 
@@ -247,7 +413,7 @@ export default function LiveConversationModal({
       if (sc.turnComplete) {
         const aiText = liveAIRef.current.trim();
         if (aiText) {
-          setTranscript((p) => [...p, { role: "model", text: aiText, id: entryIdRef.current++ }]);
+          appendTranscriptEntry({ role: "model", text: aiText });
         }
         liveAIRef.current = "";
         setLiveAIText("");
@@ -258,16 +424,29 @@ export default function LiveConversationModal({
         commitUserSpeech();
       }
     },
-    [enqueueAudio, commitUserSpeech]
+    [
+      appendTranscriptEntry,
+      commitUserSpeech,
+      enqueueAudio,
+      markSessionActivity,
+      resetVadState,
+      startAutoStopTimers,
+    ]
   );
 
   // ── Start session ────────────────────────────────────────────────────────
   const startSession = useCallback(async () => {
+    isEndingRef.current = false;
+    isLiveReadyRef.current = false;
+    clearAutoStopTimers();
+    resetVadState();
     setStatus("fetching-token");
+    transcriptRef.current = [];
     setTranscript([]);
     setEvaluation(null);
     setErrorMsg("");
     setLiveAIText("");
+    liveAIRef.current = "";
     liveUserRef.current = "";
 
     try {
@@ -354,15 +533,7 @@ ${styleGuide}
       workletNodeRef.current = worklet;
 
       worklet.port.onmessage = (e: MessageEvent<ArrayBuffer>) => {
-        if (wsRef.current?.readyState !== WebSocket.OPEN) return;
-        if (isMutedRef.current) return;
-        wsRef.current.send(
-          JSON.stringify({
-            realtimeInput: {
-              audio: { data: arrayBufferToBase64(e.data), mimeType: "audio/pcm" },
-            },
-          })
-        );
+        processMicFrame(e.data);
       };
       micSrc.connect(worklet);
 
@@ -412,21 +583,39 @@ ${styleGuide}
       setStatus("error");
       cleanup();
     }
-  }, [chapterId, chapterTitle, cleanup, handleMessage]);
+  }, [
+    chapterId,
+    chapterTitle,
+    cleanup,
+    clearAutoStopTimers,
+    handleMessage,
+    processMicFrame,
+    resetVadState,
+  ]);
 
   const endSessionAndEvaluate = useCallback(async () => {
-    cleanup();
-    commitUserSpeech(); // Ensure last bits are saved
-    
-    // Use a local variable to capture current transcript safely
-    const finalTranscript = [...transcript];
+    if (isEndingRef.current) return;
+    isEndingRef.current = true;
+
+    // Capture pending transcript before cleanup clears the live refs.
+    const finalTranscript = [...transcriptRef.current];
     const latestUserText = liveUserRef.current.trim();
     if (latestUserText) {
       finalTranscript.push({ role: "user", text: latestUserText, id: entryIdRef.current++ });
     }
 
+    const latestAIText = liveAIRef.current.trim();
+    if (latestAIText) {
+      finalTranscript.push({ role: "model", text: latestAIText, id: entryIdRef.current++ });
+    }
+
+    transcriptRef.current = finalTranscript;
+    setTranscript(finalTranscript);
+    cleanup();
+
     if (finalTranscript.length <= 1) {
       setStatus("stopped");
+      isEndingRef.current = false;
       return; // Not enough data to evaluate
     }
 
@@ -454,10 +643,17 @@ ${styleGuide}
     } catch (err) {
       console.error(err);
       setStatus("stopped"); // Fallback if eval fails
+    } finally {
+      isEndingRef.current = false;
     }
-  }, [cleanup, commitUserSpeech, transcript, chapterId]);
+  }, [cleanup, chapterId]);
+
+  useEffect(() => {
+    endSessionAndEvaluateRef.current = endSessionAndEvaluate;
+  }, [endSessionAndEvaluate]);
 
   const handleClose = useCallback(() => {
+    isEndingRef.current = false;
     cleanup();
     onClose();
   }, [cleanup, onClose]);
@@ -466,10 +662,11 @@ ${styleGuide}
     setIsMuted((prev) => {
       const next = !prev;
       isMutedRef.current = next;
+      if (next) resetVadState();
       mediaStreamRef.current?.getAudioTracks().forEach((t) => (t.enabled = !next));
       return next;
     });
-  }, []);
+  }, [resetVadState]);
 
   useEffect(() => {
     transcriptEndRef.current?.scrollIntoView({ behavior: "smooth" });
@@ -477,8 +674,10 @@ ${styleGuide}
 
   useEffect(() => {
     if (!isOpen) {
+      isEndingRef.current = false;
       cleanup();
       setStatus("idle");
+      transcriptRef.current = [];
       setTranscript([]);
       setEvaluation(null);
       setErrorMsg("");
