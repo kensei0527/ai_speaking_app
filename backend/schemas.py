@@ -16,8 +16,17 @@ class UserCreate(UserBase):
 class UserResponse(UserBase):
     id: str  # Supabase UUID
     proficiency_score: float
+    cefr_level: str = "A1"
+    placement_status: str = "pending"
+    placement_score: Optional[float] = None
+    placement_completed_at: Optional[datetime] = None
+    recommended_chapter_id: Optional[int] = None
     created_at: datetime
     model_config = ConfigDict(from_attributes=True)
+
+
+class UserUpdateRequest(BaseModel):
+    name: str
 
 
 # Chapter Schemas
@@ -117,6 +126,19 @@ class LessonStartRequest(BaseModel):
     scenario_id: int
 
 
+class LessonIntroPhrase(BaseModel):
+    phrase: str
+    meaning: str
+    usage_note: str
+    example: str
+
+
+class LessonIntro(BaseModel):
+    title: str
+    body: str
+    phrases: List[LessonIntroPhrase] = []
+
+
 class LessonQuestionInfo(BaseModel):
     id: int
     japanese_text: str
@@ -132,6 +154,7 @@ class LessonResponse(BaseModel):
     chapter_id: int
     scenario_id: Optional[int] = None
     is_review: bool = False
+    lesson_intro: Optional[LessonIntro] = None
     questions: List[LessonQuestionInfo]
     total_questions: int
 
@@ -253,14 +276,60 @@ class SkillReport(BaseModel):
 
 # Enhanced user stats
 class UserStatsResponse(BaseModel):
-    overall_level: str           # "Beginner" / "Intermediate" / "Advanced"
+    overall_level: str           # CEFR level: "A1" / "A2" / "B1" / "B2" / "C1" / "C2"
     overall_score: float
+    cefr_level: str = "A1"
+    placement_status: str = "pending"
+    placement_score: Optional[float] = None
+    recommended_chapter_id: Optional[int] = None
     chapters_mastered: int
     total_chapters: int
     total_attempts: int
     overall_accuracy: float
     weak_points: List[WeakPointInfo] = []
     chapter_progress: List[ChapterResponse] = []
+
+
+# ─── Placement Schemas ───────────────────────────────────────────────────────
+
+class PlacementQuestionInfo(BaseModel):
+    id: int
+    cefr_level: str
+    japanese_text: str
+    grammar_point: str
+    difficulty: int
+    order_index: int
+
+    model_config = ConfigDict(from_attributes=True)
+
+
+class PlacementStartResponse(BaseModel):
+    session_id: int
+    questions: List[PlacementQuestionInfo]
+    total_questions: int
+
+
+class PlacementAnswerItem(BaseModel):
+    question_id: int
+    user_answer: str
+
+
+class PlacementCompleteRequest(BaseModel):
+    answers: List[PlacementAnswerItem]
+
+
+class PlacementBandScore(BaseModel):
+    cefr_level: str
+    average_score: float
+    question_count: int
+
+
+class PlacementCompleteResponse(BaseModel):
+    session_id: int
+    cefr_level: str
+    placement_score: float
+    recommended_chapter_id: Optional[int] = None
+    band_scores: List[PlacementBandScore]
 
 
 # ─── Conversation Evaluation Schemas ──────────────────────────────────────────

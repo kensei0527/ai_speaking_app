@@ -10,6 +10,7 @@ from database import SessionLocal, engine, Base
 import models
 import google.generativeai as genai
 from dotenv import load_dotenv
+import placement_service
 
 load_dotenv()
 api_key = os.getenv("GEMINI_API_KEY")
@@ -265,6 +266,14 @@ def seed():
                     description=sc_data["description"],
                     order_index=idx
                 )
+                intro = placement_service.build_default_lesson_intro(
+                    chapter_title=chapter.title,
+                    scenario_title=scenario.title,
+                    grammar_points=chapter.grammar_points,
+                )
+                scenario.lesson_intro_title = intro["title"]
+                scenario.lesson_intro_body = intro["body"]
+                scenario.lesson_intro_phrases = json.dumps(intro["phrases"], ensure_ascii=False)
                 db.add(scenario)
                 db.flush() # get scenario.id
 

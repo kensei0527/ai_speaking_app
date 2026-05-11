@@ -112,6 +112,8 @@ def verify_token_raw(token: str, db: Session) -> Optional[models.User]:
                 id=user_id,
                 email=email or f"user_{user_id}@example.com",
                 name=payload.get("user_metadata", {}).get("full_name") or "Guest",
+                cefr_level="A1",
+                placement_status="pending",
             )
             db.add(user)
             db.commit()
@@ -141,7 +143,9 @@ def get_current_user(
             user = models.User(
                 id=user_id,
                 email=email or f"user_{user_id}@example.com",
-                name=payload.get("user_metadata", {}).get("full_name") or "Guest"
+                name=payload.get("user_metadata", {}).get("full_name") or "Guest",
+                cefr_level="A1",
+                placement_status="pending",
             )
             db.add(user)
             db.commit()

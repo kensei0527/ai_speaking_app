@@ -6,6 +6,7 @@ import Link from "next/link";
 import { motion, AnimatePresence } from "framer-motion";
 import {
   ArrowLeft,
+  ArrowRight,
   Send,
   Mic,
   MicOff,
@@ -49,9 +50,25 @@ interface LessonQuestion {
   order_index: number;
 }
 
+interface LessonIntroPhrase {
+  phrase: string;
+  meaning: string;
+  usage_note: string;
+  example: string;
+}
+
+interface LessonIntro {
+  title: string;
+  body: string;
+  phrases: LessonIntroPhrase[];
+}
+
 interface LessonData {
   lesson_id: number;
   chapter_id: number;
+  scenario_id?: number | null;
+  is_review?: boolean;
+  lesson_intro?: LessonIntro | null;
   questions: LessonQuestion[];
   total_questions: number;
 }
@@ -170,8 +187,8 @@ function LoadingScreen({ chapter }: { chapter: ChapterInfo | null }) {
       </h2>
       <p className="text-slate-500 dark:text-slate-400 text-sm mb-4">
         {chapter
-          ? `「${chapter.title}」の問題を一括生成しています`
-          : "問題を生成しています"}
+          ? `「${chapter.title}」の講義と問題を準備しています`
+          : "講義と問題を準備しています"}
       </p>
       <div className="flex gap-1.5">
         {[0, 1, 2].map((i) => (
@@ -182,6 +199,80 @@ function LoadingScreen({ chapter }: { chapter: ChapterInfo | null }) {
             className="w-2 h-2 rounded-full bg-indigo-400"
           />
         ))}
+      </div>
+    </motion.div>
+  );
+}
+
+// ─── Phase: Input / Lecture ──────────────────────────────────────────────────
+
+function IntroPhase({
+  lesson,
+  chapter,
+  onStart,
+}: {
+  lesson: LessonData;
+  chapter: ChapterInfo | null;
+  onStart: () => void;
+}) {
+  const intro = lesson.lesson_intro;
+  if (!intro) return null;
+
+  return (
+    <motion.div
+      key="intro"
+      initial={{ opacity: 0, y: 24 }}
+      animate={{ opacity: 1, y: 0 }}
+      exit={{ opacity: 0, y: -24 }}
+      className="glass-panel rounded-3xl p-6 sm:p-8"
+    >
+      <div className="mb-6 flex items-start gap-4">
+        <div className="flex h-12 w-12 flex-shrink-0 items-center justify-center rounded-2xl bg-indigo-100 text-indigo-600 dark:bg-indigo-900/40 dark:text-indigo-300">
+          <Lightbulb size={24} />
+        </div>
+        <div>
+          <p className="mb-1 text-xs font-bold uppercase text-indigo-500">
+            {chapter ? `第${chapter.number}章: ${chapter.title}` : "Lesson Input"}
+          </p>
+          <h1 className="text-2xl font-extrabold text-slate-800 dark:text-white">{intro.title}</h1>
+        </div>
+      </div>
+
+      <p className="text-sm leading-relaxed text-slate-600 dark:text-slate-300">
+        {intro.body}
+      </p>
+
+      {intro.phrases.length > 0 && (
+        <div className="mt-6 space-y-3">
+          {intro.phrases.map((item, index) => (
+            <div
+              key={`${item.phrase}-${index}`}
+              className="rounded-2xl border border-slate-100 bg-white/50 p-4 dark:border-slate-700/70 dark:bg-slate-900/30"
+            >
+              <div className="flex flex-col gap-1 sm:flex-row sm:items-baseline sm:justify-between">
+                <p className="text-lg font-extrabold text-slate-800 dark:text-white">{item.phrase}</p>
+                <p className="text-sm font-medium text-indigo-500">{item.meaning}</p>
+              </div>
+              <p className="mt-2 text-sm text-slate-500 dark:text-slate-400">{item.usage_note}</p>
+              <p className="mt-3 rounded-xl bg-slate-50 px-3 py-2 text-sm font-medium text-slate-700 dark:bg-slate-800/60 dark:text-slate-200">
+                {item.example}
+              </p>
+            </div>
+          ))}
+        </div>
+      )}
+
+      <div className="mt-8 flex flex-col-reverse gap-3 sm:flex-row sm:items-center sm:justify-between">
+        <p className="text-xs text-slate-400">
+          まず型を確認してから、{lesson.total_questions}問の英作文に進みます。
+        </p>
+        <button
+          onClick={onStart}
+          className="inline-flex items-center justify-center gap-2 rounded-full bg-indigo-600 px-6 py-3 text-sm font-bold text-white shadow-md transition hover:bg-indigo-500"
+        >
+          問題へ進む
+          <ArrowRight size={18} />
+        </button>
       </div>
     </motion.div>
   );
@@ -642,7 +733,7 @@ function ResultsPhase({
 
 // ─── Main Component ───────────────────────────────────────────────────────────
 
-type Phase = "loading" | "practicing" | "evaluating" | "results";
+type Phase = "loading" | "intro" | "practicing" | "evaluating" | "results";
 
 function PracticeContent() {
   const searchParams = useSearchParams();
@@ -757,7 +848,7 @@ function PracticeContent() {
         if (!res.ok) throw new Error("Failed to start lesson");
         const data: LessonData = await res.json();
         setLesson(data);
-        setPhase("practicing");
+        setPhase(data.lesson_intro ? "intro" : "practicing");
       } catch (err) {
         console.error(err);
       }
@@ -840,6 +931,15 @@ function PracticeContent() {
       <div className="flex-1 w-full max-w-3xl flex flex-col justify-center">
         <AnimatePresence mode="wait">
           {phase === "loading" && <LoadingScreen key="loading" chapter={chapter} />}
+
+          {phase === "intro" && lesson && (
+            <IntroPhase
+              key={`intro-${lesson.lesson_id}`}
+              lesson={lesson}
+              chapter={chapter}
+              onStart={() => setPhase("practicing")}
+            />
+          )}
 
           {phase === "practicing" && lesson && (
             <PracticePhase

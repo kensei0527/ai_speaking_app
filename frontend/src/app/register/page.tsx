@@ -52,7 +52,7 @@ export default function RegisterPage() {
             'Authorization': `Bearer ${data.session.access_token}`
           }
         })
-        router.push('/')
+        router.push('/onboarding/placement')
         router.refresh()
       } catch (err) {
         console.error("Failed to sync with backend", err)

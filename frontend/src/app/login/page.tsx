@@ -8,6 +8,8 @@ import Link from 'next/link'
 import Image from 'next/image'
 import { ArrowRight, Mail, Lock, Loader2 } from 'lucide-react'
 
+const API_URL = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
+
 export default function LoginPage() {
   const [email, setEmail] = useState('')
   const [password, setPassword] = useState('')
@@ -22,7 +24,7 @@ export default function LoginPage() {
     setIsLoading(true)
     setError(null)
     
-    const { error } = await supabase.auth.signInWithPassword({
+    const { data, error } = await supabase.auth.signInWithPassword({
       email,
       password,
     })
@@ -33,7 +35,24 @@ export default function LoginPage() {
       return
     }
 
-    router.push('/')
+    try {
+      const token = data.session?.access_token
+      if (token) {
+        const res = await fetch(`${API_URL}/api/users/me`, {
+          headers: { Authorization: `Bearer ${token}` },
+        })
+        if (res.ok) {
+          const user = await res.json()
+          router.push(user.placement_status === 'completed' ? '/' : '/onboarding/placement')
+          router.refresh()
+          return
+        }
+      }
+    } catch (err) {
+      console.error("Failed to load account after login", err)
+    }
+
+    router.push('/onboarding/placement')
     router.refresh()
   }
 

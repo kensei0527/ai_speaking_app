@@ -10,9 +10,11 @@ import json
 import uvicorn
 import os
 import httpx
+import random
 
 
 import models, schemas, database, ai_service, auth
+import placement_service
 
 models.Base.metadata.create_all(bind=database.engine)
 
@@ -39,6 +41,55 @@ app.add_middleware(
 
 from sqlalchemy import text
 
+def _try_add_column(db: Session, table: str, column_sql: str):
+    try:
+        db.execute(text(f"ALTER TABLE {table} ADD COLUMN {column_sql};"))
+        db.commit()
+    except Exception:
+        db.rollback()
+
+
+def seed_placement_questions(db: Session):
+    for idx, question_data in enumerate(placement_service.PLACEMENT_QUESTIONS):
+        existing = db.query(models.PlacementQuestion).filter(
+            models.PlacementQuestion.cefr_level == question_data["cefr_level"],
+            models.PlacementQuestion.japanese_text == question_data["japanese_text"],
+        ).first()
+        if existing:
+            continue
+        db.add(models.PlacementQuestion(
+            cefr_level=question_data["cefr_level"],
+            japanese_text=question_data["japanese_text"],
+            expected_english_text=question_data["expected_english_text"],
+            grammar_point=question_data["grammar_point"],
+            difficulty=question_data["difficulty"],
+            order_index=idx,
+        ))
+    db.commit()
+
+
+def seed_lesson_intros(db: Session):
+    scenarios = db.query(models.Scenario).all()
+    for scenario in scenarios:
+        if scenario.lesson_intro_title and scenario.lesson_intro_body and scenario.lesson_intro_phrases:
+            continue
+        chapter = db.query(models.Chapter).filter(models.Chapter.id == scenario.chapter_id).first()
+        if not chapter:
+            continue
+        intro = placement_service.build_default_lesson_intro(
+            chapter_title=chapter.title,
+            scenario_title=scenario.title,
+            grammar_points=chapter.grammar_points,
+        )
+        scenario.lesson_intro_title = scenario.lesson_intro_title or intro["title"]
+        scenario.lesson_intro_body = scenario.lesson_intro_body or intro["body"]
+        scenario.lesson_intro_phrases = scenario.lesson_intro_phrases or json.dumps(
+            intro["phrases"],
+            ensure_ascii=False,
+        )
+    db.commit()
+
+
 # ─── Startup: Seed chapters & Run migrations ─────────────────────────────────
 @app.on_event("startup")
 def startup_seed():
@@ -62,6 +113,18 @@ def startup_seed():
             db.commit()
         except Exception:
             db.rollback()
+
+        _try_add_column(db, "users", "cefr_level VARCHAR DEFAULT 'A1'")
+        _try_add_column(db, "users", "placement_status VARCHAR DEFAULT 'pending'")
+        _try_add_column(db, "users", "placement_score FLOAT")
+        _try_add_column(db, "users", "placement_completed_at TIMESTAMP")
+        _try_add_column(db, "users", "recommended_chapter_id INTEGER")
+        _try_add_column(db, "scenarios", "lesson_intro_title VARCHAR")
+        _try_add_column(db, "scenarios", "lesson_intro_body TEXT")
+        _try_add_column(db, "scenarios", "lesson_intro_phrases TEXT")
+
+        seed_placement_questions(db)
+        seed_lesson_intros(db)
 
         # Vercelでのタイムアウトを避けるため、自動シードは無効化（手動実行を推奨）
         # count = db.query(models.Chapter).count()
@@ -115,6 +178,128 @@ def ensure_chapter_progress(user: models.User, db: Session):
                 db.add(sc_progress)
 
     db.commit()
+
+
+def find_recommended_chapter(level: str, db: Session) -> models.Chapter | None:
+    normalized_level = placement_service.normalize_cefr_level(level)
+    chapters = db.query(models.Chapter).order_by(models.Chapter.number).all()
+    same_level = [
+        ch for ch in chapters
+        if placement_service.normalize_cefr_level(ch.cefr_level) == normalized_level
+    ]
+    if same_level:
+        return same_level[0]
+
+    accessible = [
+        ch for ch in chapters
+        if placement_service.can_access_chapter_level(normalized_level, ch.cefr_level)
+    ]
+    return accessible[-1] if accessible else (chapters[0] if chapters else None)
+
+
+def apply_placement_unlocks(user: models.User, db: Session):
+    ensure_chapter_progress(user, db)
+    chapters = db.query(models.Chapter).order_by(models.Chapter.number).all()
+    chapter_access: dict[int, bool] = {}
+
+    for chapter in chapters:
+        accessible = placement_service.can_access_chapter_level(user.cefr_level, chapter.cefr_level)
+        chapter_access[chapter.id] = accessible
+        progress = db.query(models.UserChapterProgress).filter(
+            models.UserChapterProgress.user_id == user.id,
+            models.UserChapterProgress.chapter_id == chapter.id,
+        ).first()
+        if not progress:
+            continue
+        if accessible:
+            if progress.status == "locked":
+                progress.status = "available"
+        elif progress.status != "mastered":
+            progress.status = "locked"
+
+    scenarios = db.query(models.Scenario).all()
+    for scenario in scenarios:
+        sc_progress = db.query(models.UserScenarioProgress).filter(
+            models.UserScenarioProgress.user_id == user.id,
+            models.UserScenarioProgress.scenario_id == scenario.id,
+        ).first()
+        if not sc_progress:
+            continue
+        if chapter_access.get(scenario.chapter_id, False):
+            if sc_progress.status == "locked":
+                sc_progress.status = "available"
+        elif sc_progress.status != "mastered":
+            sc_progress.status = "locked"
+
+    recommended = find_recommended_chapter(user.cefr_level, db)
+    user.recommended_chapter_id = recommended.id if recommended else None
+    db.commit()
+
+
+def serialize_lesson_intro(scenario: models.Scenario, chapter: models.Chapter) -> schemas.LessonIntro:
+    fallback = placement_service.build_default_lesson_intro(
+        chapter_title=chapter.title,
+        scenario_title=scenario.title,
+        grammar_points=chapter.grammar_points,
+    )
+    phrases = placement_service.parse_lesson_intro_phrases(scenario.lesson_intro_phrases)
+    if not phrases:
+        phrases = fallback["phrases"]
+    return schemas.LessonIntro(
+        title=scenario.lesson_intro_title or fallback["title"],
+        body=scenario.lesson_intro_body or fallback["body"],
+        phrases=[schemas.LessonIntroPhrase(**phrase) for phrase in phrases],
+    )
+
+
+def select_lesson_questions(
+    scenario_id: int,
+    user_level: str | None,
+    db: Session,
+    max_questions: int = 10,
+) -> list[models.Question]:
+    questions = db.query(models.Question).filter(models.Question.scenario_id == scenario_id).all()
+    if not questions:
+        return []
+
+    min_difficulty, max_difficulty = placement_service.difficulty_range_for_level(user_level)
+    preferred = [
+        q for q in questions
+        if min_difficulty <= (q.difficulty or 1) <= max_difficulty
+    ]
+    fallback = [q for q in questions if q not in preferred]
+    random.shuffle(preferred)
+    random.shuffle(fallback)
+    selected = (preferred + fallback)[:max_questions]
+    return selected
+
+
+def build_lesson_response(lesson: models.Lesson, db: Session) -> schemas.LessonResponse:
+    chapter = db.query(models.Chapter).filter(models.Chapter.id == lesson.chapter_id).first()
+    scenario = db.query(models.Scenario).filter(models.Scenario.id == lesson.scenario_id).first() if lesson.scenario_id else None
+
+    question_infos = []
+    for lq in lesson.questions:
+        q = db.query(models.Question).filter(models.Question.id == lq.question_id).first()
+        if not q:
+            continue
+        question_infos.append(schemas.LessonQuestionInfo(
+            id=q.id,
+            japanese_text=q.japanese_text,
+            grammar_point=q.grammar_point,
+            difficulty=q.difficulty,
+            order_index=lq.order_index,
+        ))
+
+    return schemas.LessonResponse(
+        lesson_id=lesson.id,
+        chapter_id=lesson.chapter_id,
+        scenario_id=lesson.scenario_id,
+        is_review=lesson.is_review,
+        lesson_intro=serialize_lesson_intro(scenario, chapter) if scenario and chapter else None,
+        questions=question_infos,
+        total_questions=lesson.total_questions,
+    )
 
 
 # ─── Helper: get weak grammar points for a chapter ──────────────────────────
@@ -282,8 +467,189 @@ def read_root():
 
 
 @app.get("/api/users/me", response_model=schemas.UserResponse)
-def get_me(user: models.User = Depends(auth.get_current_user)):
+def get_me(
+    db: Session = Depends(database.get_db),
+    user: models.User = Depends(auth.get_current_user),
+):
+    ensure_chapter_progress(user, db)
+    if not user.recommended_chapter_id:
+        recommended = find_recommended_chapter(user.cefr_level or "A1", db)
+        user.recommended_chapter_id = recommended.id if recommended else None
+        db.commit()
+        db.refresh(user)
     return user
+
+
+@app.patch("/api/users/me", response_model=schemas.UserResponse)
+def update_me(
+    req: schemas.UserUpdateRequest,
+    db: Session = Depends(database.get_db),
+    user: models.User = Depends(auth.get_current_user),
+):
+    clean_name = req.name.strip()
+    if not clean_name:
+        raise HTTPException(status_code=400, detail="Name cannot be blank")
+    user.name = clean_name[:120]
+    db.commit()
+    db.refresh(user)
+    return user
+
+
+# ─── Placement / Onboarding ──────────────────────────────────────────────────
+
+@app.post("/api/placement/start", response_model=schemas.PlacementStartResponse)
+def start_placement(
+    db: Session = Depends(database.get_db),
+    user: models.User = Depends(auth.get_current_user),
+):
+    seed_placement_questions(db)
+    questions = (
+        db.query(models.PlacementQuestion)
+        .order_by(models.PlacementQuestion.order_index, models.PlacementQuestion.id)
+        .limit(12)
+        .all()
+    )
+    if len(questions) < 12:
+        raise HTTPException(status_code=500, detail="Placement questions are not fully configured")
+
+    placement_session = models.PlacementSession(
+        user_id=user.id,
+        status="active",
+        total_questions=len(questions),
+    )
+    user.placement_status = "pending"
+    db.add(placement_session)
+    db.commit()
+    db.refresh(placement_session)
+
+    return schemas.PlacementStartResponse(
+        session_id=placement_session.id,
+        questions=[
+            schemas.PlacementQuestionInfo(
+                id=q.id,
+                cefr_level=q.cefr_level,
+                japanese_text=q.japanese_text,
+                grammar_point=q.grammar_point,
+                difficulty=q.difficulty,
+                order_index=index,
+            )
+            for index, q in enumerate(questions)
+        ],
+        total_questions=len(questions),
+    )
+
+
+@app.post("/api/placement/{session_id}/complete", response_model=schemas.PlacementCompleteResponse)
+def complete_placement(
+    session_id: int,
+    req: schemas.PlacementCompleteRequest,
+    db: Session = Depends(database.get_db),
+    user: models.User = Depends(auth.get_current_user),
+):
+    placement_session = db.query(models.PlacementSession).filter(
+        models.PlacementSession.id == session_id,
+        models.PlacementSession.user_id == user.id,
+    ).first()
+    if not placement_session:
+        raise HTTPException(status_code=404, detail="Placement session not found")
+    if placement_session.status == "completed":
+        raise HTTPException(status_code=400, detail="Placement session already completed")
+
+    expected_questions = (
+        db.query(models.PlacementQuestion)
+        .order_by(models.PlacementQuestion.order_index, models.PlacementQuestion.id)
+        .limit(placement_session.total_questions)
+        .all()
+    )
+    expected_ids = {question.id for question in expected_questions}
+    submitted_ids = [answer.question_id for answer in req.answers]
+    submitted_id_set = set(submitted_ids)
+
+    if len(submitted_ids) != len(submitted_id_set):
+        raise HTTPException(status_code=400, detail="Duplicate answers are not allowed")
+
+    missing_ids = expected_ids - submitted_id_set
+    extra_ids = submitted_id_set - expected_ids
+    if missing_ids or extra_ids:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "message": "Answers must exactly match the questions in this placement session",
+                "missing_question_ids": sorted(missing_ids),
+                "unexpected_question_ids": sorted(extra_ids),
+            },
+        )
+
+    answers_by_question_id = {}
+    for answer in req.answers:
+        clean_answer = answer.user_answer.strip()
+        if not clean_answer:
+            raise HTTPException(status_code=400, detail="Answers cannot be blank")
+        answers_by_question_id[answer.question_id] = clean_answer
+
+    scores_by_level: dict[str, list[float]] = defaultdict(list)
+    all_scores: list[float] = []
+
+    for question in expected_questions:
+        user_answer = answers_by_question_id[question.id]
+        eval_result = ai_service.evaluate_answer(
+            japanese=question.japanese_text,
+            expected_english=question.expected_english_text,
+            user_answer=user_answer,
+            grammar_point=question.grammar_point,
+        )
+        scores_by_level[question.cefr_level].append(eval_result.score)
+        all_scores.append(eval_result.score)
+        db.add(models.PlacementAnswer(
+            session_id=placement_session.id,
+            question_id=question.id,
+            user_id=user.id,
+            user_answer=user_answer,
+            is_correct=eval_result.is_correct,
+            score=eval_result.score,
+            evaluation_level=eval_result.evaluation_level,
+            ai_feedback=eval_result.feedback_text,
+        ))
+
+    level_averages = {
+        level: placement_service.average_score(scores)
+        for level, scores in scores_by_level.items()
+    }
+    result_level = placement_service.determine_cefr_level(level_averages)
+    placement_score = placement_service.average_score(all_scores)
+    recommended = find_recommended_chapter(result_level, db)
+
+    placement_session.status = "completed"
+    placement_session.completed_at = datetime.datetime.utcnow()
+    placement_session.result_level = result_level
+    placement_session.score = placement_score
+
+    user.cefr_level = result_level
+    user.placement_status = "completed"
+    user.placement_score = placement_score
+    user.placement_completed_at = placement_session.completed_at
+    user.recommended_chapter_id = recommended.id if recommended else None
+    db.commit()
+
+    apply_placement_unlocks(user, db)
+    db.refresh(user)
+
+    band_scores = []
+    for level in placement_service.CEFR_LEVELS:
+        scores = scores_by_level.get(level, [])
+        band_scores.append(schemas.PlacementBandScore(
+            cefr_level=level,
+            average_score=placement_service.average_score(scores),
+            question_count=len(scores),
+        ))
+
+    return schemas.PlacementCompleteResponse(
+        session_id=placement_session.id,
+        cefr_level=result_level,
+        placement_score=placement_score,
+        recommended_chapter_id=user.recommended_chapter_id,
+        band_scores=band_scores,
+    )
 
 
 # ─── Chapters ────────────────────────────────────────────────────────────────
@@ -421,7 +787,11 @@ def start_lesson(
     Start a new lesson based on a predefined scenario.
     Pools predefined questions from the database instead of asking AI.
     """
+    if user.placement_status != "completed":
+        raise HTTPException(status_code=403, detail="Placement test must be completed before starting lessons.")
+
     ensure_chapter_progress(user, db)
+    apply_placement_unlocks(user, db)
 
     scenario = db.query(models.Scenario).filter(models.Scenario.id == req.scenario_id).first()
     if not scenario:
@@ -449,20 +819,20 @@ def start_lesson(
     if ch_progress and ch_progress.status == "available":
         ch_progress.status = "in_progress"
 
-    # Get predefined questions from DB (shuffle them)
-    questions_query = db.query(models.Question).filter(models.Question.scenario_id == scenario.id).all()
-    if not questions_query:
+    # Get predefined questions from DB, preferring the user's CEFR difficulty band.
+    selected_questions = select_lesson_questions(
+        scenario_id=scenario.id,
+        user_level=user.cefr_level,
+        db=db,
+        max_questions=10,
+    )
+    if not selected_questions:
         raise HTTPException(
             status_code=404, 
             detail=f"No questions found for scenario ID: {scenario.id} (Title: {scenario.title})"
         )
-        
-    import random
-    random.shuffle(questions_query)
     
-    # Pick top 10 or max available
-    lesson_size = min(10, len(questions_query))
-    selected_questions = questions_query[:lesson_size]
+    lesson_size = len(selected_questions)
 
     # Create Lesson record
     lesson = models.Lesson(
@@ -486,26 +856,7 @@ def start_lesson(
     db.commit()
     db.refresh(lesson)
 
-    # Build response
-    question_infos = []
-    for lq in lesson.questions:
-        q = db.query(models.Question).filter(models.Question.id == lq.question_id).first()
-        question_infos.append(schemas.LessonQuestionInfo(
-            id=q.id,
-            japanese_text=q.japanese_text,
-            grammar_point=q.grammar_point,
-            difficulty=q.difficulty,
-            order_index=lq.order_index,
-        ))
-
-    return schemas.LessonResponse(
-        lesson_id=lesson.id,
-        chapter_id=chapter_id,
-        scenario_id=lesson.scenario_id,
-        is_review=lesson.is_review,
-        questions=question_infos,
-        total_questions=lesson.total_questions,
-    )
+    return build_lesson_response(lesson, db)
 
 
 @app.post("/api/lessons/{lesson_id}/review", response_model=schemas.LessonResponse)
@@ -520,6 +871,11 @@ def review_lesson(
     mode='weak': Only questions with score < 60
     mode='all': All questions from the previous lesson
     """
+    if user.placement_status != "completed":
+        raise HTTPException(status_code=403, detail="Placement test must be completed before starting lessons.")
+
+    apply_placement_unlocks(user, db)
+
     old_lesson = db.query(models.Lesson).filter(
         models.Lesson.id == lesson_id,
         models.Lesson.user_id == user.id
@@ -556,7 +912,6 @@ def review_lesson(
     db.add(new_lesson)
     db.flush()
     
-    import random
     random.shuffle(q_ids_to_review)
     
     for idx, q_id in enumerate(q_ids_to_review):
@@ -570,26 +925,7 @@ def review_lesson(
     db.commit()
     db.refresh(new_lesson)
     
-    # Build response
-    question_infos = []
-    for lq in new_lesson.questions:
-        q = db.query(models.Question).filter(models.Question.id == lq.question_id).first()
-        question_infos.append(schemas.LessonQuestionInfo(
-            id=q.id,
-            japanese_text=q.japanese_text,
-            grammar_point=q.grammar_point,
-            difficulty=q.difficulty,
-            order_index=lq.order_index,
-        ))
-
-    return schemas.LessonResponse(
-        lesson_id=new_lesson.id,
-        chapter_id=new_lesson.chapter_id,
-        scenario_id=new_lesson.scenario_id,
-        is_review=new_lesson.is_review,
-        questions=question_infos,
-        total_questions=new_lesson.total_questions,
-    )
+    return build_lesson_response(new_lesson, db)
 
 
 @app.post("/api/lessons/{lesson_id}/complete", response_model=schemas.LessonCompleteResponse)
@@ -1067,6 +1403,10 @@ def get_user_stats(
     user: models.User = Depends(auth.get_current_user)
 ):
     ensure_chapter_progress(user, db)
+    if not user.recommended_chapter_id:
+        recommended = find_recommended_chapter(user.cefr_level or "A1", db)
+        user.recommended_chapter_id = recommended.id if recommended else None
+        db.commit()
 
     all_attempts = db.query(models.Attempt).filter(
         models.Attempt.user_id == user.id
@@ -1108,18 +1448,7 @@ def get_user_stats(
             accuracy_rate=acc,
         ))
 
-    # Improved level determination: based on chapters mastered AND score
-    # Prevents "Advanced" from appearing after just 1 chapter
-    mastered_count = chapters_mastered
-    total_chapters = len(chapters)
-    avg_score = user.proficiency_score
-
-    if mastered_count >= 7 and avg_score >= 70:
-        overall_level = "Advanced"
-    elif mastered_count >= 3 and avg_score >= 50:
-        overall_level = "Intermediate"
-    else:
-        overall_level = "Beginner"
+    overall_level = placement_service.normalize_cefr_level(user.cefr_level)
 
     # Global weak points (across all chapters)
     all_chapter_weak = []
@@ -1138,6 +1467,10 @@ def get_user_stats(
     return schemas.UserStatsResponse(
         overall_level=overall_level,
         overall_score=round(user.proficiency_score, 1),
+        cefr_level=overall_level,
+        placement_status=user.placement_status or "pending",
+        placement_score=user.placement_score,
+        recommended_chapter_id=user.recommended_chapter_id,
         chapters_mastered=chapters_mastered,
         total_chapters=len(chapters),
         total_attempts=total_attempts,

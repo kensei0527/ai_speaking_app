@@ -11,12 +11,19 @@ class User(Base):
     email = Column(String, unique=True, index=True)
     name = Column(String, index=True, default="Guest")
     proficiency_score = Column(Float, default=0.0)  # Overall weighted average (auto-calculated)
+    cefr_level = Column(String, default="A1")
+    placement_status = Column(String, default="pending")  # pending / completed
+    placement_score = Column(Float, nullable=True)
+    placement_completed_at = Column(DateTime, nullable=True)
+    recommended_chapter_id = Column(Integer, ForeignKey("chapters.id"), nullable=True)
     created_at = Column(DateTime, default=datetime.datetime.utcnow)
 
     attempts = relationship("Attempt", back_populates="user")
     chapter_progress = relationship("UserChapterProgress", back_populates="user")
     scenario_progress = relationship("UserScenarioProgress", back_populates="user")
     lessons = relationship("Lesson", back_populates="user")
+    placement_sessions = relationship("PlacementSession", back_populates="user")
+    recommended_chapter = relationship("Chapter", foreign_keys=[recommended_chapter_id])
 
 
 class Chapter(Base):
@@ -58,6 +65,9 @@ class Scenario(Base):
     title = Column(String, nullable=False)
     description = Column(Text, nullable=True)
     order_index = Column(Integer, default=0)
+    lesson_intro_title = Column(String, nullable=True)
+    lesson_intro_body = Column(Text, nullable=True)
+    lesson_intro_phrases = Column(Text, nullable=True)  # JSON array: phrase / meaning / usage_note / example
 
     chapter = relationship("Chapter", back_populates="scenarios")
     questions = relationship("Question", back_populates="scenario")
@@ -148,3 +158,53 @@ class LessonQuestion(Base):
 
     lesson = relationship("Lesson", back_populates="questions")
     question = relationship("Question")
+
+
+class PlacementQuestion(Base):
+    __tablename__ = "placement_questions"
+
+    id = Column(Integer, primary_key=True, index=True)
+    cefr_level = Column(String, index=True, nullable=False)
+    japanese_text = Column(String, nullable=False)
+    expected_english_text = Column(String, nullable=False)
+    grammar_point = Column(String, nullable=False)
+    difficulty = Column(Integer, default=1)
+    order_index = Column(Integer, default=0)
+    created_at = Column(DateTime, default=datetime.datetime.utcnow)
+
+    answers = relationship("PlacementAnswer", back_populates="question")
+
+
+class PlacementSession(Base):
+    __tablename__ = "placement_sessions"
+
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(String, ForeignKey("users.id"), nullable=False)
+    status = Column(String, default="active")  # active / completed
+    total_questions = Column(Integer, default=0)
+    result_level = Column(String, nullable=True)
+    score = Column(Float, nullable=True)
+    started_at = Column(DateTime, default=datetime.datetime.utcnow)
+    completed_at = Column(DateTime, nullable=True)
+
+    user = relationship("User", back_populates="placement_sessions")
+    answers = relationship("PlacementAnswer", back_populates="session")
+
+
+class PlacementAnswer(Base):
+    __tablename__ = "placement_answers"
+
+    id = Column(Integer, primary_key=True, index=True)
+    session_id = Column(Integer, ForeignKey("placement_sessions.id"), nullable=False)
+    question_id = Column(Integer, ForeignKey("placement_questions.id"), nullable=False)
+    user_id = Column(String, ForeignKey("users.id"), nullable=False)
+    user_answer = Column(Text, nullable=False)
+    is_correct = Column(Boolean, default=False)
+    score = Column(Float, default=0.0)
+    evaluation_level = Column(String, nullable=True)
+    ai_feedback = Column(Text, nullable=True)
+    created_at = Column(DateTime, default=datetime.datetime.utcnow)
+
+    session = relationship("PlacementSession", back_populates="answers")
+    question = relationship("PlacementQuestion", back_populates="answers")
+    user = relationship("User")

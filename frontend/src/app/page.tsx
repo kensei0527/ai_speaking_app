@@ -19,6 +19,7 @@ import {
   Zap,
   BarChart2,
   History,
+  UserCircle,
 } from "lucide-react";
 import { motion } from "framer-motion";
 import { createClient } from "@/utils/supabase/client";
@@ -45,6 +46,10 @@ interface ChapterProgress {
 interface UserStats {
   overall_level: string;
   overall_score: number;
+  cefr_level: string;
+  placement_status: string;
+  placement_score: number | null;
+  recommended_chapter_id: number | null;
   chapters_mastered: number;
   total_chapters: number;
   total_attempts: number;
@@ -87,10 +92,13 @@ const statusConfig: Record<
   },
 };
 
-const levelConfig: Record<string, { emoji: string; gradient: string; label: string }> = {
-  Beginner: { emoji: "🌱", gradient: "from-green-400 to-emerald-500", label: "初級" },
-  Intermediate: { emoji: "🔥", gradient: "from-orange-400 to-red-500", label: "中級" },
-  Advanced: { emoji: "⚡", gradient: "from-purple-400 to-indigo-600", label: "上級" },
+const levelConfig: Record<string, { emoji: string; gradient: string; label: string; note: string }> = {
+  A1: { emoji: "🌱", gradient: "from-emerald-400 to-teal-500", label: "A1 入門", note: "基本的な自己紹介・短い日常表現" },
+  A2: { emoji: "🧭", gradient: "from-sky-400 to-cyan-500", label: "A2 初級", note: "日常場面での簡単なやりとり" },
+  B1: { emoji: "🔥", gradient: "from-amber-400 to-orange-500", label: "B1 中級", note: "理由や意見を加えた説明" },
+  B2: { emoji: "⚡", gradient: "from-violet-400 to-indigo-600", label: "B2 中上級", note: "ビジネスや抽象的な話題への対応" },
+  C1: { emoji: "💎", gradient: "from-fuchsia-400 to-rose-500", label: "C1 上級", note: "複雑な内容を自然に整理して話す力" },
+  C2: { emoji: "🏆", gradient: "from-slate-500 to-zinc-800", label: "C2 熟達", note: "高度なニュアンスまで扱う運用力" },
 };
 
 export default function Dashboard() {
@@ -116,6 +124,10 @@ export default function Dashboard() {
           },
         });
         const data = await res.json();
+        if (data.placement_status !== "completed") {
+          window.location.href = "/onboarding/placement";
+          return;
+        }
         setStats(data);
       } catch (err) {
         console.error("Error fetching stats:", err);
@@ -152,7 +164,9 @@ export default function Dashboard() {
 
   if (!stats) return null;
 
-  const level = levelConfig[stats.overall_level] || levelConfig.Beginner;
+  const cefrLevel = stats.cefr_level || stats.overall_level || "A1";
+  const level = levelConfig[cefrLevel] || levelConfig.A1;
+  const recommendedChapter = stats.chapter_progress.find((ch) => ch.id === stats.recommended_chapter_id);
 
   return (
     <main className="flex min-h-screen flex-col items-center px-4 py-8 bg-gradient-to-br from-indigo-50 via-white to-purple-50 dark:from-slate-900 dark:via-slate-800 dark:to-indigo-950">
@@ -186,6 +200,12 @@ export default function Dashboard() {
               <span className="text-sm font-medium hidden sm:inline">スキルレポート</span>
             </button>
           </Link>
+          <Link href="/account">
+            <button className="flex items-center gap-2 text-slate-400 hover:text-indigo-500 transition-colors px-3 py-2 rounded-lg hover:bg-indigo-50 dark:hover:bg-indigo-950/30">
+              <UserCircle size={18} />
+              <span className="text-sm font-medium hidden sm:inline">アカウント</span>
+            </button>
+          </Link>
           <button
             onClick={handleLogout}
             className="flex items-center gap-2 text-slate-400 hover:text-red-500 transition-colors px-3 py-2 rounded-lg hover:bg-red-50 dark:hover:bg-red-950/30"
@@ -216,11 +236,16 @@ export default function Dashboard() {
                 </p>
                 <h2 className="text-3xl font-extrabold text-slate-800 dark:text-white">
                   {level.label}{" "}
-                  <span className="text-lg font-medium text-slate-400">({stats.overall_level})</span>
+                  <span className="text-lg font-medium text-slate-400">({cefrLevel})</span>
                 </h2>
                 <p className="text-xs text-slate-400 dark:text-slate-500 mt-1">
-                  {stats.chapters_mastered}章マスター・スコア{stats.overall_score.toFixed(0)}に基づく判定
+                  {level.note}
                 </p>
+                {stats.placement_score !== null && (
+                  <p className="text-xs text-slate-400 dark:text-slate-500 mt-1">
+                    初回判定スコア {stats.placement_score.toFixed(0)}
+                  </p>
+                )}
               </div>
             </div>
             <div className="flex gap-4 sm:gap-6 flex-wrap">
@@ -310,6 +335,33 @@ export default function Dashboard() {
             </div>
           </motion.div>
         </div>
+
+        {recommendedChapter && (
+          <motion.div
+            initial={{ opacity: 0, y: 20 }}
+            animate={{ opacity: 1, y: 0 }}
+            transition={{ delay: 0.22 }}
+            className="glass-panel rounded-2xl p-5 sm:p-6 border-l-4 border-cyan-400 dark:border-cyan-500"
+          >
+            <div className="flex flex-col sm:flex-row items-start sm:items-center justify-between gap-4">
+              <div>
+                <div className="flex items-center gap-2 mb-1">
+                  <Sparkles size={18} className="text-cyan-500" />
+                  <h3 className="font-bold text-slate-700 dark:text-slate-200">おすすめ開始章</h3>
+                </div>
+                <p className="text-sm text-slate-500 dark:text-slate-400">
+                  現在のCEFRレベルに合わせて、第{recommendedChapter.number}章「{recommendedChapter.title}」から始めるのがおすすめです。
+                </p>
+              </div>
+              <Link href={`/chapters/${recommendedChapter.id}`} className="flex-shrink-0">
+                <button className="flex items-center gap-2 px-5 py-2.5 bg-cyan-600 hover:bg-cyan-500 text-white text-sm font-bold rounded-full shadow-md hover:shadow-lg transition-all">
+                  <ChevronRight size={16} />
+                  開始する
+                </button>
+              </Link>
+            </div>
+          </motion.div>
+        )}
 
         {/* ── Weak Points ────────────────────────────────────────── */}
         {stats.weak_points.length > 0 && (
